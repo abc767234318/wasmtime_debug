@@ -11,4 +11,4 @@
     clippy::clone_on_copy
 )]
 
-include!(concat!(env!("ISLE_DIR"), "/isle_s390x.rs"));
+include!(concat!("../../../../../../isle-sources", "/isle_s390x.rs"));
