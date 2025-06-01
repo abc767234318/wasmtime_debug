@@ -13,6 +13,7 @@
 //! specific to Wasmtime and has fewer gymnastics to implement.
 
 #![expect(non_camel_case_types, reason = "matching C style, not Rust")]
+#![expect(unsafe_op_in_unsafe_fn, reason = "crate isn't migrated yet")]
 
 pub use wasmtime;
 
@@ -40,13 +41,13 @@ mod vec;
 pub use crate::config::*;
 pub use crate::engine::*;
 pub use crate::error::*;
+pub use crate::r#extern::*;
 pub use crate::func::*;
 pub use crate::global::*;
 pub use crate::instance::*;
 pub use crate::linker::*;
 pub use crate::memory::*;
 pub use crate::module::*;
-pub use crate::r#extern::*;
 pub use crate::r#ref::*;
 pub use crate::store::*;
 pub use crate::table::*;
@@ -69,6 +70,11 @@ pub use crate::wasi::*;
 mod wat2wasm;
 #[cfg(feature = "wat")]
 pub use crate::wat2wasm::*;
+
+#[cfg(feature = "component-model")]
+mod component;
+#[cfg(feature = "component-model")]
+pub use crate::component::*;
 
 /// Initialize a `MaybeUninit<T>`
 ///

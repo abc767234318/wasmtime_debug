@@ -1,13 +1,13 @@
+use crate::ScopeVec;
 use crate::component::*;
 use crate::prelude::*;
-use crate::ScopeVec;
 use crate::{
     EngineOrModuleTypeIndex, EntityIndex, ModuleEnvironment, ModuleInternedTypeIndex,
     ModuleTranslation, ModuleTypesBuilder, PrimaryMap, TagIndex, Tunables, TypeConvert,
     WasmHeapType, WasmResult, WasmValType,
 };
 use anyhow::anyhow;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use indexmap::IndexMap;
 use std::collections::HashMap;
 use std::mem;
@@ -540,7 +540,7 @@ impl<'a, 'data> Translator<'a, 'data> {
                 for ty in s {
                     match ty? {
                         wasmparser::ComponentType::Resource { rep, dtor } => {
-                            let rep = self.types.convert_valtype(rep);
+                            let rep = self.types.convert_valtype(rep)?;
                             let id = types
                                 .component_any_type_at(component_type_index)
                                 .unwrap_resource();
@@ -638,10 +638,6 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let ty = self.core_func_signature(core_func_index)?;
                             core_func_index += 1;
                             LocalInitializer::ResourceRep(resource, ty)
-                        }
-                        wasmparser::CanonicalFunction::ThreadSpawn { .. }
-                        | wasmparser::CanonicalFunction::ThreadAvailableParallelism => {
-                            bail!("unsupported intrinsic")
                         }
                         wasmparser::CanonicalFunction::BackpressureSet => {
                             let core_type = self.core_func_signature(core_func_index)?;
@@ -813,6 +809,15 @@ impl<'a, 'data> Translator<'a, 'data> {
                             let func = self.core_func_signature(core_func_index)?;
                             core_func_index += 1;
                             LocalInitializer::ErrorContextDrop { func }
+                        }
+                        wasmparser::CanonicalFunction::ContextGet(..)
+                        | wasmparser::CanonicalFunction::ContextSet(..)
+                        | wasmparser::CanonicalFunction::TaskCancel
+                        | wasmparser::CanonicalFunction::SubtaskCancel { .. }
+                        | wasmparser::CanonicalFunction::ThreadSpawnRef { .. }
+                        | wasmparser::CanonicalFunction::ThreadSpawnIndirect { .. }
+                        | wasmparser::CanonicalFunction::ThreadAvailableParallelism => {
+                            bail!("unsupported intrinsic")
                         }
                     };
                     self.result.initializers.push(init);
@@ -1214,6 +1219,7 @@ impl<'a, 'data> Translator<'a, 'data> {
                     let idx = FuncIndex::from_u32(*idx);
                     ret.callback = Some(idx);
                 }
+                wasmparser::CanonicalOption::CoreType(_) => todo!(),
             }
         }
         return ret;

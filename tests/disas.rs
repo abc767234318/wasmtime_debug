@@ -39,7 +39,7 @@
 //! at the start of the file. These comments are then parsed as TOML and
 //! deserialized into `TestConfig` in this crate.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use cranelift_codegen::ir::{Function, UserExternalName, UserFuncName};
 use libtest_mimic::{Arguments, Trial};
@@ -112,6 +112,7 @@ struct TestConfig {
     test: TestKind,
     flags: Option<TestConfigFlags>,
     objdump: Option<TestConfigFlags>,
+    filter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,13 +159,14 @@ impl Test {
     fn new(path: &Path) -> Result<Test> {
         let contents =
             std::fs::read_to_string(path).with_context(|| format!("failed to read {path:?}"))?;
-        let config: TestConfig = wasmtime_test_util::wast::parse_test_config(&contents)
+        let config: TestConfig = wasmtime_test_util::wast::parse_test_config(&contents, ";;!")
             .context("failed to parse test configuration as TOML")?;
         let mut flags = vec!["wasmtime"];
         if let Some(config) = &config.flags {
             flags.extend(config.to_vec());
         }
-        let opts = wasmtime_cli_flags::CommonOptions::try_parse_from(&flags)?;
+        let mut opts = wasmtime_cli_flags::CommonOptions::try_parse_from(&flags)?;
+        opts.codegen.cranelift_debug_verifier = Some(true);
 
         Ok(Test {
             path: path.to_path_buf(),
@@ -195,10 +197,16 @@ impl Test {
             }
         }
         let engine = Engine::new(&config).context("failed to create engine")?;
-        let module = wat::parse_file(&self.path)?;
-        let elf = engine
-            .precompile_module(&module)
-            .context("failed to compile module")?;
+        let wasm = wat::parse_file(&self.path)?;
+        let elf = if wasmparser::Parser::is_component(&wasm) {
+            engine
+                .precompile_component(&wasm)
+                .context("failed to compile component")?
+        } else {
+            engine
+                .precompile_module(&wasm)
+                .context("failed to compile module")?
+        };
 
         match self.config.test {
             TestKind::Clif | TestKind::Optimize => {
@@ -213,7 +221,8 @@ impl Test {
                     let entry = entry.context("failed to iterate over tempdir")?;
                     let path = entry.path();
                     if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        if !name.starts_with("wasm_func_") {
+                        let filter = self.config.filter.as_deref().unwrap_or("wasm_func_");
+                        if !name.contains(filter) {
                             continue;
                         }
                     }
@@ -275,6 +284,9 @@ fn assert_output(test: &Test, output: CompileOutput) -> Result<()> {
                 None => {
                     cmd.arg("--traps=false");
                 }
+            }
+            if let Some(filter) = &test.config.filter {
+                cmd.arg("--filter").arg(filter);
             }
 
             let mut child = cmd.spawn().context("failed to run wasmtime")?;

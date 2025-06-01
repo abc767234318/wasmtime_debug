@@ -7,6 +7,7 @@ pub mod constant;
 pub mod dfg;
 pub mod dynamic_type;
 pub mod entities;
+mod exception_table;
 mod extfunc;
 mod extname;
 pub mod function;
@@ -36,11 +37,13 @@ pub use crate::ir::builder::{
 };
 pub use crate::ir::constant::{ConstantData, ConstantPool};
 pub use crate::ir::dfg::{BlockData, DataFlowGraph, ValueDef};
-pub use crate::ir::dynamic_type::{dynamic_to_fixed, DynamicTypeData, DynamicTypes};
+pub use crate::ir::dynamic_type::{DynamicTypeData, DynamicTypes, dynamic_to_fixed};
 pub use crate::ir::entities::{
-    Block, Constant, DynamicStackSlot, DynamicType, FuncRef, GlobalValue, Immediate, Inst,
-    JumpTable, MemoryType, SigRef, StackSlot, UserExternalNameRef, Value,
+    Block, Constant, DynamicStackSlot, DynamicType, ExceptionTable, ExceptionTag, FuncRef,
+    GlobalValue, Immediate, Inst, JumpTable, MemoryType, SigRef, StackSlot, UserExternalNameRef,
+    Value,
 };
+pub use crate::ir::exception_table::ExceptionTableData;
 pub use crate::ir::extfunc::{
     AbiParam, ArgumentExtension, ArgumentPurpose, ExtFuncData, Signature,
 };
@@ -48,12 +51,12 @@ pub use crate::ir::extname::{ExternalName, UserExternalName, UserFuncName};
 pub use crate::ir::function::Function;
 pub use crate::ir::globalvalue::GlobalValueData;
 pub use crate::ir::instructions::{
-    BlockCall, InstructionData, Opcode, ValueList, ValueListPool, VariableArgs,
+    BlockArg, BlockCall, InstructionData, Opcode, ValueList, ValueListPool, VariableArgs,
 };
 pub use crate::ir::jumptable::JumpTableData;
 pub use crate::ir::known_symbol::KnownSymbol;
 pub use crate::ir::layout::Layout;
-pub use crate::ir::libcall::{get_probestack_funcref, LibCall};
+pub use crate::ir::libcall::{LibCall, get_probestack_funcref};
 pub use crate::ir::memflags::{AliasRegion, Endianness, MemFlags};
 pub use crate::ir::memtype::{MemoryTypeData, MemoryTypeField};
 pub use crate::ir::pcc::{BaseExpr, Expr, Fact, FactContext, PccError, PccResult};
@@ -67,10 +70,13 @@ pub use crate::ir::trapcode::TrapCode;
 pub use crate::ir::types::Type;
 pub use crate::ir::user_stack_maps::{UserStackMap, UserStackMapEntry};
 
-use crate::entity::{entity_impl, PrimaryMap, SecondaryMap};
+use crate::entity::{PrimaryMap, SecondaryMap, entity_impl};
 
 /// Map of jump tables.
 pub type JumpTables = PrimaryMap<JumpTable, JumpTableData>;
+
+/// Map of exception tables.
+pub type ExceptionTables = PrimaryMap<ExceptionTable, ExceptionTableData>;
 
 /// Source locations for instructions.
 pub(crate) type SourceLocs = SecondaryMap<Inst, RelSourceLoc>;
@@ -79,7 +85,7 @@ pub(crate) type SourceLocs = SecondaryMap<Inst, RelSourceLoc>;
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 pub struct ValueLabel(u32);
-entity_impl!(ValueLabel, "val");
+entity_impl!(ValueLabel, "VL");
 
 /// A label of a Value.
 #[derive(Debug, Clone, PartialEq, Hash)]

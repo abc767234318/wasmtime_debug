@@ -5,7 +5,7 @@ mod vm_host_func_context;
 
 pub use self::vm_host_func_context::VMArrayCallHostFuncContext;
 use crate::prelude::*;
-use crate::runtime::vm::{GcStore, InterpreterRef, VMGcRef, VmPtr, VmSafe};
+use crate::runtime::vm::{GcStore, InterpreterRef, VMGcRef, VmPtr, VmSafe, f32x4, f64x2, i8x16};
 use crate::store::StoreOpaque;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -14,10 +14,9 @@ use core::marker;
 use core::mem::{self, MaybeUninit};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use sptr::Strict;
 use wasmtime_environ::{
-    BuiltinFunctionIndex, DefinedMemoryIndex, Unsigned, VMSharedTypeIndex, WasmHeapTopType,
-    WasmValType, VMCONTEXT_MAGIC,
+    BuiltinFunctionIndex, DefinedMemoryIndex, Unsigned, VMCONTEXT_MAGIC, VMSharedTypeIndex,
+    WasmHeapTopType, WasmValType,
 };
 
 /// A function pointer that exposes the array calling convention.
@@ -144,7 +143,7 @@ mod test_vmfunction_body {
 /// imported from another instance.
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-pub struct VMTableImport {
+pub struct VMTable {
     /// A pointer to the imported table description.
     pub from: VmPtr<VMTableDefinition>,
 
@@ -153,30 +152,43 @@ pub struct VMTableImport {
 }
 
 // SAFETY: the above structure is repr(C) and only contains `VmSafe` fields.
-unsafe impl VmSafe for VMTableImport {}
+unsafe impl VmSafe for VMTable {}
 
 #[cfg(test)]
-mod test_vmtable_import {
-    use super::VMTableImport;
+mod test_vmtable {
+    use super::VMTable;
     use core::mem::offset_of;
     use std::mem::size_of;
+    use wasmtime_environ::component::{Component, VMComponentOffsets};
     use wasmtime_environ::{HostPtr, Module, VMOffsets};
 
     #[test]
-    fn check_vmtable_import_offsets() {
+    fn check_vmtable_offsets() {
         let module = Module::new();
         let offsets = VMOffsets::new(HostPtr, &module);
+        assert_eq!(size_of::<VMTable>(), usize::from(offsets.size_of_vmtable()));
         assert_eq!(
-            size_of::<VMTableImport>(),
-            usize::from(offsets.size_of_vmtable_import())
+            offset_of!(VMTable, from),
+            usize::from(offsets.vmtable_from())
         );
         assert_eq!(
-            offset_of!(VMTableImport, from),
-            usize::from(offsets.vmtable_import_from())
+            offset_of!(VMTable, vmctx),
+            usize::from(offsets.vmtable_vmctx())
         );
+    }
+
+    #[test]
+    fn ensure_sizes_match() {
+        // Because we use `VMTable` for recording tables used by components, we
+        // want to make sure that the size calculations between `VMOffsets` and
+        // `VMComponentOffsets` stay the same.
+        let module = Module::new();
+        let vm_offsets = VMOffsets::new(HostPtr, &module);
+        let component = Component::default();
+        let vm_component_offsets = VMComponentOffsets::new(HostPtr, &component);
         assert_eq!(
-            offset_of!(VMTableImport, vmctx),
-            usize::from(offsets.vmtable_import_vmctx())
+            vm_offsets.size_of_vmtable(),
+            vm_component_offsets.size_of_vmtable()
         );
     }
 }
@@ -441,6 +453,8 @@ mod test_vmglobal_definition {
         assert!(align_of::<VMGlobalDefinition>() >= align_of::<f32>());
         assert!(align_of::<VMGlobalDefinition>() >= align_of::<f64>());
         assert!(align_of::<VMGlobalDefinition>() >= align_of::<[u8; 16]>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<[f32; 4]>());
+        assert!(align_of::<VMGlobalDefinition>() >= align_of::<[f64; 2]>());
     }
 
     #[test]
@@ -820,6 +834,7 @@ impl VMFuncRef {
     ///
     /// Note that the unsafety invariants to maintain here are not currently
     /// exhaustively documented.
+    #[inline]
     pub unsafe fn array_call(
         &self,
         pulley: Option<InterpreterRef<'_>>,
@@ -854,6 +869,7 @@ impl VMFuncRef {
         )
     }
 
+    #[inline]
     unsafe fn array_call_native(
         &self,
         caller: NonNull<VMOpaqueContext>,
@@ -919,9 +935,12 @@ macro_rules! define_builtin_array {
     ) => {
         /// An array that stores addresses of builtin functions. We translate code
         /// to use indirect calls. This way, we don't have to patch the code.
+        ///
+        /// Ignore improper ctypes to permit `__m128i` on x86_64.
         #[repr(C)]
         pub struct VMBuiltinFunctionsArray {
             $(
+                #[allow(improper_ctypes_definitions)]
                 $name: unsafe extern "C" fn(
                     $(define_builtin_array!(@ty $param)),*
                 ) $( -> define_builtin_array!(@ty $result))?,
@@ -947,7 +966,6 @@ macro_rules! define_builtin_array {
             /// pointer is considered valid.
             pub fn expose_provenance(&self) -> NonNull<Self>{
                 $(
-                    #[cfg(has_provenance_apis)]
                     (self.$name as *mut u8).expose_provenance();
                 )*
                 NonNull::from(self)
@@ -957,7 +975,12 @@ macro_rules! define_builtin_array {
 
     (@ty u32) => (u32);
     (@ty u64) => (u64);
+    (@ty f32) => (f32);
+    (@ty f64) => (f64);
     (@ty u8) => (u8);
+    (@ty i8x16) => (i8x16);
+    (@ty f32x4) => (f32x4);
+    (@ty f64x2) => (f64x2);
     (@ty bool) => (bool);
     (@ty pointer) => (*mut u8);
     (@ty vmctx) => (NonNull<VMContext>);
@@ -1010,6 +1033,9 @@ pub struct VMStoreContext {
     /// For more information see `crates/cranelift/src/lib.rs`.
     pub stack_limit: UnsafeCell<usize>,
 
+    /// The `VMMemoryDefinition` for this store's GC heap.
+    pub gc_heap: VMMemoryDefinition,
+
     /// The value of the frame pointer register when we last called from Wasm to
     /// the host.
     ///
@@ -1019,7 +1045,7 @@ pub struct VMStoreContext {
     /// This member is `0` when Wasm is actively running and has not called out
     /// to the host.
     ///
-    /// Used to find the start of a a contiguous sequence of Wasm frames when
+    /// Used to find the start of a contiguous sequence of Wasm frames when
     /// walking the stack.
     pub last_wasm_exit_fp: UnsafeCell<usize>,
 
@@ -1066,9 +1092,13 @@ unsafe impl VmSafe for VMStoreContext {}
 impl Default for VMStoreContext {
     fn default() -> VMStoreContext {
         VMStoreContext {
-            stack_limit: UnsafeCell::new(usize::max_value()),
             fuel_consumed: UnsafeCell::new(0),
             epoch_deadline: UnsafeCell::new(0),
+            stack_limit: UnsafeCell::new(usize::max_value()),
+            gc_heap: VMMemoryDefinition {
+                base: NonNull::dangling().into(),
+                current_length: AtomicUsize::new(0),
+            },
             last_wasm_exit_fp: UnsafeCell::new(0),
             last_wasm_exit_pc: UnsafeCell::new(0),
             last_wasm_entry_fp: UnsafeCell::new(0),
@@ -1078,7 +1108,7 @@ impl Default for VMStoreContext {
 
 #[cfg(test)]
 mod test_vmstore_context {
-    use super::VMStoreContext;
+    use super::{VMMemoryDefinition, VMStoreContext};
     use core::mem::offset_of;
     use wasmtime_environ::{HostPtr, Module, PtrSize, VMOffsets};
 
@@ -1097,6 +1127,18 @@ mod test_vmstore_context {
         assert_eq!(
             offset_of!(VMStoreContext, epoch_deadline),
             usize::from(offsets.ptr.vmstore_context_epoch_deadline())
+        );
+        assert_eq!(
+            offset_of!(VMStoreContext, gc_heap),
+            usize::from(offsets.ptr.vmstore_context_gc_heap())
+        );
+        assert_eq!(
+            offset_of!(VMStoreContext, gc_heap) + offset_of!(VMMemoryDefinition, base),
+            usize::from(offsets.ptr.vmstore_context_gc_heap_base())
+        );
+        assert_eq!(
+            offset_of!(VMStoreContext, gc_heap) + offset_of!(VMMemoryDefinition, current_length),
+            usize::from(offsets.ptr.vmstore_context_gc_heap_current_length())
         );
         assert_eq!(
             offset_of!(VMStoreContext, last_wasm_exit_fp),
@@ -1366,7 +1408,7 @@ impl ValRaw {
     #[inline]
     pub fn funcref(i: *mut c_void) -> ValRaw {
         ValRaw {
-            funcref: Strict::map_addr(i, |i| i.to_le()),
+            funcref: i.map_addr(|i| i.to_le()),
         }
     }
 
@@ -1431,7 +1473,7 @@ impl ValRaw {
     /// Gets the WebAssembly `funcref` value
     #[inline]
     pub fn get_funcref(&self) -> *mut c_void {
-        unsafe { Strict::map_addr(self.funcref, |i| usize::from_le(i)) }
+        unsafe { self.funcref.map_addr(|i| usize::from_le(i)) }
     }
 
     /// Gets the WebAssembly `externref` value

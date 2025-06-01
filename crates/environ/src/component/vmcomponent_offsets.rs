@@ -8,13 +8,14 @@
 //      trampoline_func_refs: [VMFuncRef; component.num_trampolines],
 //      lowerings: [VMLowering; component.num_lowerings],
 //      memories: [*mut VMMemoryDefinition; component.num_runtime_memories],
+//      tables: [VMTable; component.num_runtime_tables],
 //      reallocs: [*mut VMFuncRef; component.num_runtime_reallocs],
 //      post_returns: [*mut VMFuncRef; component.num_runtime_post_returns],
 //      resource_destructors: [*mut VMFuncRef; component.num_resources],
 // }
 
-use crate::component::*;
 use crate::PtrSize;
+use crate::component::*;
 
 /// Equivalent of `VMCONTEXT_MAGIC` except for components.
 ///
@@ -44,6 +45,8 @@ pub struct VMComponentOffsets<P> {
     pub num_lowerings: u32,
     /// The number of memories which are recorded in this component for options.
     pub num_runtime_memories: u32,
+    /// The number of tables which are recorded in this component for options.
+    pub num_runtime_tables: u32,
     /// The number of reallocs which are recorded in this component for options.
     pub num_runtime_reallocs: u32,
     /// The number of callbacks which are recorded in this component for options.
@@ -66,6 +69,7 @@ pub struct VMComponentOffsets<P> {
     trampoline_func_refs: u32,
     lowerings: u32,
     memories: u32,
+    tables: u32,
     reallocs: u32,
     callbacks: u32,
     post_returns: u32,
@@ -86,14 +90,12 @@ impl<P: PtrSize> VMComponentOffsets<P> {
         let mut ret = Self {
             ptr,
             num_lowerings: component.num_lowerings,
-            num_runtime_memories: component.num_runtime_memories.try_into().unwrap(),
-            num_runtime_reallocs: component.num_runtime_reallocs.try_into().unwrap(),
-            num_runtime_callbacks: component.num_runtime_callbacks.try_into().unwrap(),
-            num_runtime_post_returns: component.num_runtime_post_returns.try_into().unwrap(),
-            num_runtime_component_instances: component
-                .num_runtime_component_instances
-                .try_into()
-                .unwrap(),
+            num_runtime_memories: component.num_runtime_memories,
+            num_runtime_tables: component.num_runtime_tables,
+            num_runtime_reallocs: component.num_runtime_reallocs,
+            num_runtime_callbacks: component.num_runtime_callbacks,
+            num_runtime_post_returns: component.num_runtime_post_returns,
+            num_runtime_component_instances: component.num_runtime_component_instances,
             num_trampolines: component.trampolines.len().try_into().unwrap(),
             num_resources: component.num_resources,
             magic: 0,
@@ -103,6 +105,7 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             trampoline_func_refs: 0,
             lowerings: 0,
             memories: 0,
+            tables: 0,
             reallocs: 0,
             callbacks: 0,
             post_returns: 0,
@@ -145,6 +148,7 @@ impl<P: PtrSize> VMComponentOffsets<P> {
             size(trampoline_func_refs) = cmul(ret.num_trampolines, ret.ptr.size_of_vm_func_ref()),
             size(lowerings) = cmul(ret.num_lowerings, ret.ptr.size() * 2),
             size(memories) = cmul(ret.num_runtime_memories, ret.ptr.size()),
+            size(tables) = cmul(ret.num_runtime_tables, ret.size_of_vmtable()),
             size(reallocs) = cmul(ret.num_runtime_reallocs, ret.ptr.size()),
             size(callbacks) = cmul(ret.num_runtime_callbacks, ret.ptr.size()),
             size(post_returns) = cmul(ret.num_runtime_post_returns, ret.ptr.size()),
@@ -260,6 +264,26 @@ impl<P: PtrSize> VMComponentOffsets<P> {
     pub fn runtime_memory(&self, index: RuntimeMemoryIndex) -> u32 {
         assert!(index.as_u32() < self.num_runtime_memories);
         self.runtime_memories() + index.as_u32() * u32::from(self.ptr.size())
+    }
+
+    /// The offset of the base of the `runtime_tables` field
+    #[inline]
+    pub fn runtime_tables(&self) -> u32 {
+        self.tables
+    }
+
+    /// The offset of the table for the runtime index provided.
+    #[inline]
+    pub fn runtime_table(&self, index: RuntimeTableIndex) -> u32 {
+        assert!(index.as_u32() < self.num_runtime_tables);
+        self.runtime_tables() + index.as_u32() * u32::from(self.size_of_vmtable())
+    }
+
+    /// Return the size of `VMTable`, used here to hold the pointers to
+    /// the `VMTableDefinition` and `VMContext`.
+    #[inline]
+    pub fn size_of_vmtable(&self) -> u8 {
+        2 * self.pointer_size()
     }
 
     /// The offset of the base of the `runtime_reallocs` field

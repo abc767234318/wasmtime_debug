@@ -5,29 +5,26 @@ use crate::ir::types::*;
 
 use crate::isa;
 
-use crate::isa::riscv64::{inst::*, Riscv64Backend};
 use crate::isa::CallConv;
+use crate::isa::riscv64::inst::*;
 use crate::machinst::*;
 
+use crate::CodegenResult;
 use crate::ir::LibCall;
 use crate::ir::Signature;
 use crate::isa::riscv64::settings::Flags as RiscvFlags;
 use crate::isa::unwind::UnwindInst;
 use crate::settings;
-use crate::CodegenResult;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use regalloc2::{MachineEnv, PReg, PRegSet};
 
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::borrow::ToOwned;
 use std::sync::OnceLock;
 
 /// Support for the Riscv64 ABI from the callee side (within a function body).
 pub(crate) type Riscv64Callee = Callee<Riscv64MachineDeps>;
-
-/// Support for the Riscv64 ABI from the caller side (at a callsite).
-pub(crate) type Riscv64ABICallSite = CallSite<Riscv64MachineDeps>;
 
 /// Riscv64-specific ABI behavior. This struct just serves as an implementation
 /// point for the trait; it is never actually instantiated.
@@ -95,6 +92,8 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         add_ret_area_ptr: bool,
         mut args: ArgsAccumulator,
     ) -> CodegenResult<(u32, Option<usize>)> {
+        // This implements the LP64D RISC-V ABI.
+
         assert_ne!(
             call_conv,
             isa::CallConv::Winch,
@@ -555,30 +554,6 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         insts
     }
 
-    fn gen_call(dest: &CallDest, tmp: Writable<Reg>, info: CallInfo<()>) -> SmallVec<[Self::I; 2]> {
-        let mut insts = SmallVec::new();
-        match &dest {
-            CallDest::ExtName(name, RelocDistance::Near) => {
-                let info = Box::new(info.map(|()| name.clone()));
-                insts.push(Inst::Call { info })
-            }
-            CallDest::ExtName(name, RelocDistance::Far) => {
-                insts.push(Inst::LoadExtName {
-                    rd: tmp,
-                    name: Box::new(name.clone()),
-                    offset: 0,
-                });
-                let info = Box::new(info.map(|()| tmp.to_reg()));
-                insts.push(Inst::CallInd { info });
-            }
-            CallDest::Reg(reg) => {
-                let info = Box::new(info.map(|()| *reg));
-                insts.push(Inst::CallInd { info });
-            }
-        }
-        insts
-    }
-
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
         call_conv: isa::CallConv,
         dst: Reg,
@@ -591,7 +566,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         let arg1 = Writable::from_reg(x_reg(11));
         let arg2 = Writable::from_reg(x_reg(12));
         let tmp = alloc_tmp(Self::word_type());
-        insts.extend(Inst::load_constant_u64(tmp, size as u64).into_iter());
+        insts.extend(Inst::load_constant_u64(tmp, size as u64));
         insts.push(Inst::Call {
             info: Box::new(CallInfo {
                 dest: ExternalName::LibCall(LibCall::Memcpy),
@@ -610,10 +585,11 @@ impl ABIMachineSpec for Riscv64MachineDeps {
                     }
                 ],
                 defs: smallvec![],
-                clobbers: Self::get_regs_clobbered_by_call(call_conv),
+                clobbers: Self::get_regs_clobbered_by_call(call_conv, false),
                 caller_conv: call_conv,
                 callee_conv: call_conv,
                 callee_pop_size: 0,
+                try_call_info: None,
             }),
         });
         insts
@@ -637,8 +613,14 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         MACHINE_ENV.get_or_init(create_reg_environment)
     }
 
-    fn get_regs_clobbered_by_call(_call_conv_of_callee: isa::CallConv) -> PRegSet {
-        DEFAULT_CLOBBERS
+    fn get_regs_clobbered_by_call(
+        call_conv_of_callee: isa::CallConv,
+        is_exception: bool,
+    ) -> PRegSet {
+        match call_conv_of_callee {
+            isa::CallConv::Tail if is_exception => ALL_CLOBBERS,
+            _ => DEFAULT_CLOBBERS,
+        }
     }
 
     fn compute_frame_layout(
@@ -649,6 +631,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
         is_leaf: bool,
         incoming_args_size: u32,
         tail_args_size: u32,
+        stackslots_size: u32,
         fixed_frame_storage_size: u32,
         outgoing_args_size: u32,
     ) -> FrameLayout {
@@ -684,6 +667,7 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             setup_area_size,
             clobber_size,
             fixed_frame_storage_size,
+            stackslots_size,
             outgoing_args_size,
             clobbered_callee_saves: regs,
         }
@@ -719,59 +703,18 @@ impl ABIMachineSpec for Riscv64MachineDeps {
             });
         }
     }
-}
 
-impl Riscv64ABICallSite {
-    pub fn emit_return_call(
-        mut self,
-        ctx: &mut Lower<Inst>,
-        args: isle::ValueSlice,
-        _backend: &Riscv64Backend,
-    ) {
-        let new_stack_arg_size =
-            u32::try_from(self.sig(ctx.sigs()).sized_stack_arg_space()).unwrap();
+    fn retval_temp_reg(_call_conv_of_callee: isa::CallConv) -> Writable<Reg> {
+        // Use x12 as a temp if needed: clobbered, not a
+        // retval.
+        Writable::from_reg(regs::x_reg(12))
+    }
 
-        ctx.abi_mut().accumulate_tail_args_size(new_stack_arg_size);
-
-        // Put all arguments in registers and stack slots (within that newly
-        // allocated stack space).
-        self.emit_args(ctx, args);
-        self.emit_stack_ret_arg_for_tail_call(ctx);
-
-        let dest = self.dest().clone();
-        let uses = self.take_uses();
-
-        match dest {
-            CallDest::ExtName(name, RelocDistance::Near) => {
-                let info = Box::new(ReturnCallInfo {
-                    dest: name,
-                    uses,
-                    new_stack_arg_size,
-                });
-                ctx.emit(Inst::ReturnCall { info });
-            }
-            CallDest::ExtName(name, RelocDistance::Far) => {
-                let callee = ctx.alloc_tmp(ir::types::I64).only_reg().unwrap();
-                ctx.emit(Inst::LoadExtName {
-                    rd: callee,
-                    name: Box::new(name),
-                    offset: 0,
-                });
-                let info = Box::new(ReturnCallInfo {
-                    dest: callee.to_reg(),
-                    uses,
-                    new_stack_arg_size,
-                });
-                ctx.emit(Inst::ReturnCallInd { info });
-            }
-            CallDest::Reg(callee) => {
-                let info = Box::new(ReturnCallInfo {
-                    dest: callee,
-                    uses,
-                    new_stack_arg_size,
-                });
-                ctx.emit(Inst::ReturnCallInd { info });
-            }
+    fn exception_payload_regs(call_conv: isa::CallConv) -> &'static [Reg] {
+        const PAYLOAD_REGS: &'static [Reg] = &[regs::a0(), regs::a1()];
+        match call_conv {
+            isa::CallConv::SystemV | isa::CallConv::Tail => PAYLOAD_REGS,
+            _ => &[],
         }
     }
 }
@@ -861,6 +804,104 @@ const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(pf_reg(30))
     .with(pf_reg(31))
     // V Regs - All vector regs get clobbered
+    .with(pv_reg(0))
+    .with(pv_reg(1))
+    .with(pv_reg(2))
+    .with(pv_reg(3))
+    .with(pv_reg(4))
+    .with(pv_reg(5))
+    .with(pv_reg(6))
+    .with(pv_reg(7))
+    .with(pv_reg(8))
+    .with(pv_reg(9))
+    .with(pv_reg(10))
+    .with(pv_reg(11))
+    .with(pv_reg(12))
+    .with(pv_reg(13))
+    .with(pv_reg(14))
+    .with(pv_reg(15))
+    .with(pv_reg(16))
+    .with(pv_reg(17))
+    .with(pv_reg(18))
+    .with(pv_reg(19))
+    .with(pv_reg(20))
+    .with(pv_reg(21))
+    .with(pv_reg(22))
+    .with(pv_reg(23))
+    .with(pv_reg(24))
+    .with(pv_reg(25))
+    .with(pv_reg(26))
+    .with(pv_reg(27))
+    .with(pv_reg(28))
+    .with(pv_reg(29))
+    .with(pv_reg(30))
+    .with(pv_reg(31));
+
+const ALL_CLOBBERS: PRegSet = PRegSet::empty()
+    // Specials: x0 is the zero register; x1 is the return address; x2 is SP.
+    .with(px_reg(3))
+    .with(px_reg(4))
+    .with(px_reg(5))
+    .with(px_reg(6))
+    .with(px_reg(7))
+    .with(px_reg(8))
+    .with(px_reg(9))
+    .with(px_reg(10))
+    .with(px_reg(11))
+    .with(px_reg(12))
+    .with(px_reg(13))
+    .with(px_reg(14))
+    .with(px_reg(15))
+    .with(px_reg(16))
+    .with(px_reg(17))
+    .with(px_reg(18))
+    .with(px_reg(19))
+    .with(px_reg(20))
+    .with(px_reg(21))
+    .with(px_reg(22))
+    .with(px_reg(23))
+    .with(px_reg(24))
+    .with(px_reg(25))
+    .with(px_reg(26))
+    .with(px_reg(27))
+    .with(px_reg(28))
+    .with(px_reg(29))
+    .with(px_reg(30))
+    .with(px_reg(31))
+    // F Regs
+    .with(pf_reg(0))
+    .with(pf_reg(1))
+    .with(pf_reg(2))
+    .with(pf_reg(3))
+    .with(pf_reg(4))
+    .with(pf_reg(5))
+    .with(pf_reg(6))
+    .with(pf_reg(7))
+    .with(pf_reg(8))
+    .with(pf_reg(9))
+    .with(pf_reg(10))
+    .with(pf_reg(11))
+    .with(pf_reg(12))
+    .with(pf_reg(13))
+    .with(pf_reg(14))
+    .with(pf_reg(15))
+    .with(pf_reg(16))
+    .with(pf_reg(17))
+    .with(pf_reg(18))
+    .with(pf_reg(19))
+    .with(pf_reg(20))
+    .with(pf_reg(21))
+    .with(pf_reg(22))
+    .with(pf_reg(23))
+    .with(pf_reg(24))
+    .with(pf_reg(25))
+    .with(pf_reg(26))
+    .with(pf_reg(27))
+    .with(pf_reg(28))
+    .with(pf_reg(29))
+    .with(pf_reg(30))
+    .with(pf_reg(31))
+    // V Regs
     .with(pv_reg(0))
     .with(pv_reg(1))
     .with(pv_reg(2))

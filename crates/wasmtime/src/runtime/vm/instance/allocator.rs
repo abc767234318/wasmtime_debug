@@ -6,7 +6,7 @@ use crate::runtime::vm::memory::Memory;
 use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::table::Table;
 use crate::runtime::vm::{CompiledModuleId, ModuleRuntimeInfo, VMFuncRef, VMGcRef, VMStore};
-use crate::store::{AutoAssertNoGc, StoreOpaque};
+use crate::store::{AutoAssertNoGc, InstanceId, StoreOpaque};
 use crate::vm::VMGlobalDefinition;
 use core::ptr::NonNull;
 use core::{any::Any, mem, ptr};
@@ -21,8 +21,8 @@ use crate::runtime::vm::{GcHeap, GcRuntime};
 
 #[cfg(feature = "component-model")]
 use wasmtime_environ::{
-    component::{Component, VMComponentOffsets},
     StaticModuleIndex,
+    component::{Component, VMComponentOffsets},
 };
 
 mod on_demand;
@@ -38,6 +38,10 @@ pub use self::pooling::{
 
 /// Represents a request for a new runtime instance.
 pub struct InstanceAllocationRequest<'a> {
+    /// The instance id that this will be assigned within the store once the
+    /// allocation has finished.
+    pub id: InstanceId,
+
     /// The info related to the compiled version of this module,
     /// needed for instantiation: function metadata, JIT code
     /// addresses, precomputed images for lazy memory and table
@@ -93,6 +97,13 @@ pub struct InstanceAllocationRequest<'a> {
 /// itself, because several use-sites require a split mut borrow on the
 /// InstanceAllocationRequest.
 pub struct StorePtr(Option<NonNull<dyn VMStore>>);
+
+// We can't make `VMStore: Send + Sync` because that requires making all of
+// Wastime's internals generic over the `Store`'s `T`. So instead, we take care
+// in the whole VM layer to only use the `VMStore` in ways that are `Send`- and
+// `Sync`-safe and we have to have these unsafe impls.
+unsafe impl Send for StorePtr {}
+unsafe impl Sync for StorePtr {}
 
 impl StorePtr {
     /// A pointer to no Store.
@@ -203,6 +214,10 @@ pub unsafe trait InstanceAllocatorImpl {
     /// Validate whether a module is allocatable by this instance allocator.
     fn validate_module_impl(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()>;
 
+    /// Validate whether a memory is allocatable by this instance allocator.
+    #[cfg(feature = "gc")]
+    fn validate_memory_impl(&self, memory: &wasmtime_environ::Memory) -> Result<()>;
+
     /// Increment the count of concurrent component instances that are currently
     /// allocated, if applicable.
     ///
@@ -243,13 +258,14 @@ pub unsafe trait InstanceAllocatorImpl {
     /// # Unsafety
     ///
     /// The memory and its associated module must have already been validated by
-    /// `Self::validate_module` and passed that validation.
+    /// `Self::validate_memory` (or transtively via
+    /// `Self::validate_{module,component}`) and passed that validation.
     unsafe fn allocate_memory(
         &self,
         request: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Memory,
         tunables: &Tunables,
-        memory_index: DefinedMemoryIndex,
+        memory_index: Option<DefinedMemoryIndex>,
     ) -> Result<(MemoryAllocationIndex, Memory)>;
 
     /// Deallocate an instance's previously allocated memory.
@@ -261,7 +277,7 @@ pub unsafe trait InstanceAllocatorImpl {
     /// allocated. It must never be used again.
     unsafe fn deallocate_memory(
         &self,
-        memory_index: DefinedMemoryIndex,
+        memory_index: Option<DefinedMemoryIndex>,
         allocation_index: MemoryAllocationIndex,
         memory: Memory,
     );
@@ -314,12 +330,20 @@ pub unsafe trait InstanceAllocatorImpl {
         &self,
         engine: &crate::Engine,
         gc_runtime: &dyn GcRuntime,
+        memory_alloc_index: MemoryAllocationIndex,
+        memory: Memory,
     ) -> Result<(GcHeapAllocationIndex, Box<dyn GcHeap>)>;
 
     /// Deallocate a GC heap that was previously allocated with
     /// `allocate_gc_heap`.
     #[cfg(feature = "gc")]
-    fn deallocate_gc_heap(&self, allocation_index: GcHeapAllocationIndex, gc_heap: Box<dyn GcHeap>);
+    #[must_use = "it is the caller's responsibility to deallocate the GC heap's underlying memory \
+                  storage after the GC heap is deallocated"]
+    fn deallocate_gc_heap(
+        &self,
+        allocation_index: GcHeapAllocationIndex,
+        gc_heap: Box<dyn GcHeap>,
+    ) -> (MemoryAllocationIndex, Memory);
 
     /// Purges all lingering resources related to `module` from within this
     /// allocator.
@@ -369,6 +393,12 @@ pub trait InstanceAllocator: InstanceAllocatorImpl {
     /// allocator.
     fn validate_module(&self, module: &Module, offsets: &VMOffsets<HostPtr>) -> Result<()> {
         InstanceAllocatorImpl::validate_module_impl(self, module, offsets)
+    }
+
+    /// Validate whether a memory is allocatable with this instance allocator.
+    #[cfg(feature = "gc")]
+    fn validate_memory(&self, memory: &wasmtime_environ::Memory) -> Result<()> {
+        InstanceAllocatorImpl::validate_memory_impl(self, memory)
     }
 
     /// Allocates a fresh `InstanceHandle` for the `req` given.
@@ -460,7 +490,12 @@ pub trait InstanceAllocator: InstanceAllocatorImpl {
                 .defined_memory_index(memory_index)
                 .expect("should be a defined memory since we skipped imported ones");
 
-            memories.push(self.allocate_memory(request, ty, request.tunables, memory_index)?);
+            memories.push(self.allocate_memory(
+                request,
+                ty,
+                request.tunables,
+                Some(memory_index),
+            )?);
         }
 
         Ok(())
@@ -481,7 +516,7 @@ pub trait InstanceAllocator: InstanceAllocatorImpl {
             // about leaking subsequent memories if the first memory failed to
             // deallocate. If deallocating memory ever becomes fallible, we will
             // need to be careful here!
-            self.deallocate_memory(memory_index, allocation_index, memory);
+            self.deallocate_memory(Some(memory_index), allocation_index, memory);
         }
     }
 

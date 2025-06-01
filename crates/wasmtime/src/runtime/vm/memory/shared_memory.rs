@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::runtime::vm::memory::{validate_atomic_addr, LocalMemory, MmapMemory};
+use crate::runtime::vm::memory::{LocalMemory, MmapMemory, validate_atomic_addr};
 use crate::runtime::vm::parking_spot::{ParkingSpot, Waiter};
 use crate::runtime::vm::{Memory, VMMemoryDefinition, VMStore, WaitResult};
 use std::cell::RefCell;
@@ -40,7 +40,7 @@ impl SharedMemory {
     }
 
     /// Wrap an existing [Memory] with the locking provided by a [SharedMemory].
-    pub fn wrap(ty: &wasmtime_environ::Memory, mut memory: LocalMemory) -> Result<Self> {
+    pub fn wrap(ty: &wasmtime_environ::Memory, memory: LocalMemory) -> Result<Self> {
         if !ty.shared {
             bail!("shared memory must have a `shared` memory type");
         }

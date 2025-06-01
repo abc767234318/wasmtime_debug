@@ -8,11 +8,11 @@
 #![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use cranelift_codegen::{
-    binemit,
+    FinalizedMachReloc, FinalizedRelocTarget, MachTrap, binemit,
     cursor::FuncCursor,
     ir::{self, AbiParam, ArgumentPurpose, ExternalName, InstBuilder, Signature, TrapCode},
     isa::{CallConv, TargetIsa},
-    settings, FinalizedMachReloc, FinalizedRelocTarget, MachTrap,
+    settings,
 };
 use cranelift_entity::PrimaryMap;
 
@@ -30,6 +30,7 @@ pub use obj::*;
 mod compiled_function;
 pub use compiled_function::*;
 
+mod bounds_checks;
 mod builder;
 mod compiler;
 mod debug;
@@ -306,8 +307,9 @@ fn mach_reloc_to_reloc(
             }
         }
         FinalizedRelocTarget::ExternalName(ExternalName::LibCall(libcall)) => {
-            let libcall = libcall_cranelift_to_wasmtime(libcall);
-            RelocationTarget::HostLibcall(libcall)
+            // We should have avoided any code that needs this style of libcalls
+            // in the Wasm-to-Cranelift translator.
+            panic!("unexpected libcall {libcall:?}");
         }
         _ => panic!("unrecognized external name"),
     };
@@ -316,24 +318,6 @@ fn mach_reloc_to_reloc(
         reloc_target,
         offset,
         addend,
-    }
-}
-
-fn libcall_cranelift_to_wasmtime(call: ir::LibCall) -> wasmtime_environ::obj::LibCall {
-    use wasmtime_environ::obj::LibCall as LC;
-    match call {
-        ir::LibCall::FloorF32 => LC::FloorF32,
-        ir::LibCall::FloorF64 => LC::FloorF64,
-        ir::LibCall::NearestF32 => LC::NearestF32,
-        ir::LibCall::NearestF64 => LC::NearestF64,
-        ir::LibCall::CeilF32 => LC::CeilF32,
-        ir::LibCall::CeilF64 => LC::CeilF64,
-        ir::LibCall::TruncF32 => LC::TruncF32,
-        ir::LibCall::TruncF64 => LC::TruncF64,
-        ir::LibCall::FmaF32 => LC::FmaF32,
-        ir::LibCall::FmaF64 => LC::FmaF64,
-        ir::LibCall::X86Pshufb => LC::X86Pshufb,
-        _ => panic!("cranelift emitted a libcall wasmtime does not support: {call:?}"),
     }
 }
 
@@ -372,8 +356,28 @@ impl BuiltinFunctionSignatures {
         AbiParam::new(ir::types::I64)
     }
 
+    fn f32(&self) -> AbiParam {
+        AbiParam::new(ir::types::F32)
+    }
+
+    fn f64(&self) -> AbiParam {
+        AbiParam::new(ir::types::F64)
+    }
+
     fn u8(&self) -> AbiParam {
         AbiParam::new(ir::types::I8)
+    }
+
+    fn i8x16(&self) -> AbiParam {
+        AbiParam::new(ir::types::I8X16)
+    }
+
+    fn f32x4(&self) -> AbiParam {
+        AbiParam::new(ir::types::F32X4)
+    }
+
+    fn f64x2(&self) -> AbiParam {
+        AbiParam::new(ir::types::F64X2)
     }
 
     fn bool(&self) -> AbiParam {
@@ -431,3 +435,19 @@ impl BuiltinFunctionSignatures {
 /// Must be kept in sync with
 /// `crate::runtime::vm::gc::VMGcRef::I31_REF_DISCRIMINANT`.
 const I31_REF_DISCRIMINANT: u32 = 1;
+
+/// Like `Option<T>` but specifically for passing information about transitions
+/// from reachable to unreachable state and the like from callees to callers.
+///
+/// Marked `must_use` to force callers to update
+/// `FuncTranslationState::reachable` as necessary.
+#[derive(PartialEq, Eq)]
+#[must_use]
+enum Reachability<T> {
+    /// The Wasm execution state is reachable, here is a `T`.
+    Reachable(T),
+    /// The Wasm execution state has been determined to be statically
+    /// unreachable. It is the receiver of this value's responsibility to update
+    /// `FuncTranslationState::reachable` as necessary.
+    Unreachable,
+}

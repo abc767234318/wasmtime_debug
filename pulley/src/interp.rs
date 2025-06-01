@@ -12,7 +12,9 @@ use core::mem;
 use core::ops::ControlFlow;
 use core::ops::{Index, IndexMut};
 use core::ptr::NonNull;
+use pulley_macros::interp_disable_if_cfg;
 use wasmtime_math::WasmFloat;
+
 mod debug;
 #[cfg(all(not(pulley_tail_calls), not(pulley_assume_llvm_makes_tail_calls)))]
 mod match_loop;
@@ -78,13 +80,15 @@ impl Vm {
     where
         T: IntoIterator<Item = RegType> + 'a,
     {
-        let lr = self.call_start(args);
+        unsafe {
+            let lr = self.call_start(args);
 
-        match self.call_run(func) {
-            DoneReason::ReturnToHost(()) => DoneReason::ReturnToHost(self.call_end(lr, rets)),
-            DoneReason::Trap { pc, kind } => DoneReason::Trap { pc, kind },
-            DoneReason::CallIndirectHost { id, resume } => {
-                DoneReason::CallIndirectHost { id, resume }
+            match self.call_run(func) {
+                DoneReason::ReturnToHost(()) => DoneReason::ReturnToHost(self.call_end(lr, rets)),
+                DoneReason::Trap { pc, kind } => DoneReason::Trap { pc, kind },
+                DoneReason::CallIndirectHost { id, resume } => {
+                    DoneReason::CallIndirectHost { id, resume }
+                }
             }
         }
     }
@@ -107,9 +111,10 @@ impl Vm {
         // NB: make sure this method stays in sync with
         // `PulleyMachineDeps::compute_arg_locs`!
 
-        let mut x_args = (0..16).map(|x| XReg::new_unchecked(x));
-        let mut f_args = (0..16).map(|f| FReg::new_unchecked(f));
-        let mut v_args = (0..16).map(|v| VReg::new_unchecked(v));
+        let mut x_args = (0..16).map(|x| unsafe { XReg::new_unchecked(x) });
+        let mut f_args = (0..16).map(|f| unsafe { FReg::new_unchecked(f) });
+        #[cfg(not(pulley_disable_interp_simd))]
+        let mut v_args = (0..16).map(|v| unsafe { VReg::new_unchecked(v) });
 
         for arg in args {
             match arg {
@@ -121,6 +126,7 @@ impl Vm {
                     Some(reg) => self.state[reg] = *val,
                     None => todo!("stack slots"),
                 },
+                #[cfg(not(pulley_disable_interp_simd))]
                 Val::VReg(val) => match v_args.next() {
                     Some(reg) => self.state[reg] = *val,
                     None => todo!("stack slots"),
@@ -143,7 +149,7 @@ impl Vm {
         self.state.debug_assert_done_reason_none();
         let interpreter = Interpreter {
             state: &mut self.state,
-            pc: UnsafeBytecodeStream::new(pc),
+            pc: unsafe { UnsafeBytecodeStream::new(pc) },
             executing_pc: self.executing_pc.as_ref(),
         };
         let done = interpreter.run();
@@ -169,9 +175,10 @@ impl Vm {
         // NB: make sure this method stays in sync with
         // `PulleyMachineDeps::compute_arg_locs`!
 
-        let mut x_rets = (0..15).map(|x| XReg::new_unchecked(x));
-        let mut f_rets = (0..16).map(|f| FReg::new_unchecked(f));
-        let mut v_rets = (0..16).map(|v| VReg::new_unchecked(v));
+        let mut x_rets = (0..15).map(|x| unsafe { XReg::new_unchecked(x) });
+        let mut f_rets = (0..16).map(|f| unsafe { FReg::new_unchecked(f) });
+        #[cfg(not(pulley_disable_interp_simd))]
+        let mut v_rets = (0..16).map(|v| unsafe { VReg::new_unchecked(v) });
 
         rets.into_iter().map(move |ty| match ty {
             RegType::XReg => match x_rets.next() {
@@ -182,10 +189,13 @@ impl Vm {
                 Some(reg) => Val::FReg(self.state[reg]),
                 None => todo!("stack slots"),
             },
+            #[cfg(not(pulley_disable_interp_simd))]
             RegType::VReg => match v_rets.next() {
                 Some(reg) => Val::VReg(self.state[reg]),
                 None => todo!("stack slots"),
             },
+            #[cfg(pulley_disable_interp_simd)]
+            RegType::VReg => panic!("simd support disabled at compile time"),
         })
     }
 
@@ -250,6 +260,7 @@ pub enum Val {
     FReg(FRegVal),
 
     /// A `v` register value: vectors.
+    #[cfg(not(pulley_disable_interp_simd))]
     VReg(VRegVal),
 }
 
@@ -258,6 +269,7 @@ impl fmt::LowerHex for Val {
         match self {
             Val::XReg(v) => fmt::LowerHex::fmt(v, f),
             Val::FReg(v) => fmt::LowerHex::fmt(v, f),
+            #[cfg(not(pulley_disable_interp_simd))]
             Val::VReg(v) => fmt::LowerHex::fmt(v, f),
         }
     }
@@ -317,6 +329,7 @@ impl From<f32> for Val {
     }
 }
 
+#[cfg(not(pulley_disable_interp_simd))]
 impl From<VRegVal> for Val {
     fn from(value: VRegVal) -> Self {
         Val::VReg(value)
@@ -472,11 +485,7 @@ impl XRegVal {
 
     pub fn get_ptr<T>(&self) -> *mut T {
         let ptr = unsafe { self.0.ptr };
-        let ptr = usize::from_le(ptr);
-        #[cfg(has_provenance_apis)]
-        return core::ptr::with_exposed_provenance_mut(ptr);
-        #[cfg(not(has_provenance_apis))]
-        return ptr as *mut T;
+        core::ptr::with_exposed_provenance_mut(usize::from_le(ptr))
     }
 
     pub fn set_i32(&mut self, x: i32) {
@@ -496,11 +505,7 @@ impl XRegVal {
     }
 
     pub fn set_ptr<T>(&mut self, ptr: *mut T) {
-        #[cfg(has_provenance_apis)]
-        let ptr = ptr.expose_provenance();
-        #[cfg(not(has_provenance_apis))]
-        let ptr = ptr as usize;
-        self.0.ptr = ptr.to_le();
+        self.0.ptr = ptr.expose_provenance().to_le();
     }
 }
 
@@ -572,8 +577,10 @@ impl FRegVal {
 
 /// A `v` register value: vectors.
 #[derive(Copy, Clone)]
+#[cfg(not(pulley_disable_interp_simd))]
 pub struct VRegVal(VRegUnion);
 
+#[cfg(not(pulley_disable_interp_simd))]
 impl fmt::Debug for VRegVal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VRegVal")
@@ -582,6 +589,7 @@ impl fmt::Debug for VRegVal {
     }
 }
 
+#[cfg(not(pulley_disable_interp_simd))]
 impl fmt::LowerHex for VRegVal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::LowerHex::fmt(unsafe { &self.0.u128 }, f)
@@ -597,6 +605,7 @@ impl fmt::LowerHex for VRegVal {
 /// vectors works. This union cannot be stored in big-endian.
 #[derive(Copy, Clone)]
 #[repr(align(16))]
+#[cfg(not(pulley_disable_interp_simd))]
 union VRegUnion {
     u128: u128,
     i8x16: [i8; 16],
@@ -614,6 +623,7 @@ union VRegUnion {
     f64x2: [u64; 2],
 }
 
+#[cfg(not(pulley_disable_interp_simd))]
 impl Default for VRegVal {
     fn default() -> Self {
         Self(unsafe { mem::zeroed() })
@@ -621,6 +631,7 @@ impl Default for VRegVal {
 }
 
 #[expect(missing_docs, reason = "self-describing methods")]
+#[cfg(not(pulley_disable_interp_simd))]
 impl VRegVal {
     pub fn new_u128(i: u128) -> Self {
         let mut val = Self::default();
@@ -733,6 +744,7 @@ impl VRegVal {
 pub struct MachineState {
     x_regs: [XRegVal; XReg::RANGE.end as usize],
     f_regs: [FRegVal; FReg::RANGE.end as usize],
+    #[cfg(not(pulley_disable_interp_simd))]
     v_regs: [VRegVal; VReg::RANGE.end as usize],
     fp: *mut u8,
     lr: *mut u8,
@@ -804,6 +816,7 @@ impl fmt::Debug for MachineState {
         let MachineState {
             x_regs,
             f_regs,
+            #[cfg(not(pulley_disable_interp_simd))]
             v_regs,
             stack: _,
             done_reason: _,
@@ -823,20 +836,22 @@ impl fmt::Debug for MachineState {
             }
         }
 
-        f.debug_struct("MachineState")
-            .field(
-                "x_regs",
-                &RegMap(x_regs, |i| XReg::new(i).unwrap().to_string()),
-            )
-            .field(
-                "f_regs",
-                &RegMap(f_regs, |i| FReg::new(i).unwrap().to_string()),
-            )
-            .field(
-                "v_regs",
-                &RegMap(v_regs, |i| VReg::new(i).unwrap().to_string()),
-            )
-            .finish_non_exhaustive()
+        let mut f = f.debug_struct("MachineState");
+
+        f.field(
+            "x_regs",
+            &RegMap(x_regs, |i| XReg::new(i).unwrap().to_string()),
+        )
+        .field(
+            "f_regs",
+            &RegMap(f_regs, |i| FReg::new(i).unwrap().to_string()),
+        );
+        #[cfg(not(pulley_disable_interp_simd))]
+        f.field(
+            "v_regs",
+            &RegMap(v_regs, |i| VReg::new(i).unwrap().to_string()),
+        );
+        f.finish_non_exhaustive()
     }
 }
 
@@ -874,6 +889,7 @@ macro_rules! index_reg {
 
 index_reg!(XReg, XRegVal, x_regs);
 index_reg!(FReg, FRegVal, f_regs);
+#[cfg(not(pulley_disable_interp_simd))]
 index_reg!(VReg, VRegVal, v_regs);
 
 /// Sentinel return address that signals the end of the call stack.
@@ -884,6 +900,7 @@ impl MachineState {
         let mut state = Self {
             x_regs: [Default::default(); XReg::RANGE.end as usize],
             f_regs: Default::default(),
+            #[cfg(not(pulley_disable_interp_simd))]
             v_regs: Default::default(),
             stack: Stack::new(stack_size),
             done_reason: None,
@@ -940,6 +957,7 @@ mod done {
         IntegerOverflow,
         BadConversionToInteger,
         MemoryOutOfBounds,
+        DisabledOpcode,
     }
 
     impl MachineState {
@@ -1125,12 +1143,14 @@ impl Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[cfg(not(pulley_disable_interp_simd))]
     fn get_i128(&self, lo: XReg, hi: XReg) -> i128 {
         let lo = self.state[lo].get_u64();
         let hi = self.state[hi].get_i64();
         i128::from(lo) | (i128::from(hi) << 64)
     }
 
+    #[cfg(not(pulley_disable_interp_simd))]
     fn set_i128(&mut self, lo: XReg, hi: XReg, val: i128) {
         self.state[lo].set_u64(val as u64);
         self.state[hi].set_u64((val >> 64) as u64);
@@ -1673,7 +1693,7 @@ impl OpVisitor for Interpreter<'_> {
 
     fn xadd32_u32(&mut self, dst: XReg, src1: XReg, src2: u32) -> ControlFlow<Done> {
         let a = self.state[src1].get_u32();
-        self.state[dst].set_u32(a.wrapping_add(src2.into()));
+        self.state[dst].set_u32(a.wrapping_add(src2));
         ControlFlow::Continue(())
     }
 
@@ -1723,7 +1743,7 @@ impl OpVisitor for Interpreter<'_> {
 
     fn xsub32_u32(&mut self, dst: XReg, src1: XReg, src2: u32) -> ControlFlow<Done> {
         let a = self.state[src1].get_u32();
-        self.state[dst].set_u32(a.wrapping_sub(src2.into()));
+        self.state[dst].set_u32(a.wrapping_sub(src2));
         ControlFlow::Continue(())
     }
 
@@ -3050,12 +3070,14 @@ impl ExtendedOpVisitor for Interpreter<'_> {
     // =========================================================================
     // o32 addressing modes for little-endian V-registers
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload128le_o32(&mut self, dst: VReg, addr: AddrO32) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<u128, crate::VLoad128O32>(addr)? };
         self.state[dst].set_u128(u128::from_le(val));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vstore128le_o32(&mut self, addr: AddrO32, src: VReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u128();
         unsafe {
@@ -3067,12 +3089,14 @@ impl ExtendedOpVisitor for Interpreter<'_> {
     // =========================================================================
     // z addressing modes for little-endian V-registers
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload128le_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<u128, crate::VLoad128Z>(addr)? };
         self.state[dst].set_u128(u128::from_le(val));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vstore128le_z(&mut self, addr: AddrZ, src: VReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u128();
         unsafe {
@@ -3084,12 +3108,14 @@ impl ExtendedOpVisitor for Interpreter<'_> {
     // =========================================================================
     // g32 addressing modes for little-endian V-registers
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload128le_g32(&mut self, dst: VReg, addr: AddrG32) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<u128, crate::VLoad128G32>(addr)? };
         self.state[dst].set_u128(u128::from_le(val));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vstore128le_g32(&mut self, addr: AddrG32, src: VReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u128();
         unsafe {
@@ -3116,6 +3142,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmov(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let val = self.state[src];
         self.state[dst] = val;
@@ -3444,6 +3471,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -3461,6 +3489,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmulf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -3478,6 +3507,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vdivf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -3491,6 +3521,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vdivf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -3524,6 +3555,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vtrunc32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3533,6 +3565,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vtrunc64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f64x2();
         for elem in a.iter_mut() {
@@ -3548,6 +3581,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfloor32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3557,6 +3591,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfloor64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f64x2();
         for elem in a.iter_mut() {
@@ -3572,6 +3607,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vceil32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3582,6 +3618,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vceil64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f64x2();
         for elem in a.iter_mut() {
@@ -3598,6 +3635,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnearest32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3607,6 +3645,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnearest64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f64x2();
         for elem in a.iter_mut() {
@@ -3622,6 +3661,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsqrt32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3631,6 +3671,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsqrt64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f64x2();
         for elem in a.iter_mut() {
@@ -3646,6 +3687,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnegf32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let mut a = self.state[src].get_f32x4();
         for elem in a.iter_mut() {
@@ -3745,6 +3787,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -3755,6 +3798,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -3765,6 +3809,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -3775,6 +3820,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -3785,6 +3831,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -3795,6 +3842,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -3805,6 +3853,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi8x16_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -3815,6 +3864,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddu8x16_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -3825,6 +3875,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddi16x8_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -3835,6 +3886,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddu16x8_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -3845,6 +3897,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddpairwisei16x8_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -3858,6 +3911,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vaddpairwisei32x4_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -3870,6 +3924,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshli8x16(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_u32();
@@ -3877,6 +3932,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshli16x8(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_u32();
@@ -3884,6 +3940,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshli32x4(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_u32();
@@ -3891,6 +3948,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshli64x2(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_u32();
@@ -3898,6 +3956,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri8x16_s(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_u32();
@@ -3905,6 +3964,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri16x8_s(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_u32();
@@ -3912,6 +3972,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri32x4_s(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_u32();
@@ -3919,6 +3980,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri64x2_s(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_u32();
@@ -3926,6 +3988,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri8x16_u(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u32();
@@ -3933,6 +3996,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri16x8_u(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u32();
@@ -3940,6 +4004,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri32x4_u(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32();
@@ -3947,6 +4012,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshri64x2_u(&mut self, operands: BinaryOperands<VReg, VReg, XReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u32();
@@ -3954,83 +4020,97 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vconst128(&mut self, dst: VReg, val: u128) -> ControlFlow<Done> {
         self.state[dst].set_u128(val);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatx8(&mut self, dst: VReg, src: XReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u32() as u8;
         self.state[dst].set_u8x16([val; 16]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatx16(&mut self, dst: VReg, src: XReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u32() as u16;
         self.state[dst].set_u16x8([val; 8]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatx32(&mut self, dst: VReg, src: XReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u32();
         self.state[dst].set_u32x4([val; 4]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatx64(&mut self, dst: VReg, src: XReg) -> ControlFlow<Done> {
         let val = self.state[src].get_u64();
         self.state[dst].set_u64x2([val; 2]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatf32(&mut self, dst: VReg, src: FReg) -> ControlFlow<Done> {
         let val = self.state[src].get_f32();
         self.state[dst].set_f32x4([val; 4]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsplatf64(&mut self, dst: VReg, src: FReg) -> ControlFlow<Done> {
         let val = self.state[src].get_f64();
         self.state[dst].set_f64x2([val; 2]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload8x8_s_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[i8; 8], crate::VLoad8x8SZ>(addr)? };
         self.state[dst].set_i16x8(val.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload8x8_u_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[u8; 8], crate::VLoad8x8UZ>(addr)? };
         self.state[dst].set_u16x8(val.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload16x4le_s_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[i16; 4], crate::VLoad16x4LeSZ>(addr)? };
         self.state[dst].set_i32x4(val.map(|i| i16::from_le(i).into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload16x4le_u_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[u16; 4], crate::VLoad16x4LeUZ>(addr)? };
         self.state[dst].set_u32x4(val.map(|i| u16::from_le(i).into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload32x2le_s_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[i32; 2], crate::VLoad32x2LeSZ>(addr)? };
         self.state[dst].set_i64x2(val.map(|i| i32::from_le(i).into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vload32x2le_u_z(&mut self, dst: VReg, addr: AddrZ) -> ControlFlow<Done> {
         let val = unsafe { self.load_ne::<[u32; 2], crate::VLoad32x2LeUZ>(addr)? };
         self.state[dst].set_u64x2(val.map(|i| u32::from_le(i).into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vband128(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u128();
         let b = self.state[operands.src2].get_u128();
@@ -4038,6 +4118,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbor128(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u128();
         let b = self.state[operands.src2].get_u128();
@@ -4045,6 +4126,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbxor128(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u128();
         let b = self.state[operands.src2].get_u128();
@@ -4052,12 +4134,14 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbnot128(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u128();
         self.state[dst].set_u128(!a);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbitselect128(&mut self, dst: VReg, c: VReg, x: VReg, y: VReg) -> ControlFlow<Done> {
         let c = self.state[c].get_u128();
         let x = self.state[x].get_u128();
@@ -4066,6 +4150,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbitmask8x16(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u8x16();
         let mut result = 0;
@@ -4077,6 +4162,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbitmask16x8(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u16x8();
         let mut result = 0;
@@ -4088,6 +4174,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbitmask32x4(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u32x4();
         let mut result = 0;
@@ -4099,6 +4186,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vbitmask64x2(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u64x2();
         let mut result = 0;
@@ -4110,6 +4198,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn valltrue8x16(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u8x16();
         let result = a.iter().all(|a| *a != 0);
@@ -4117,6 +4206,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn valltrue16x8(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u16x8();
         let result = a.iter().all(|a| *a != 0);
@@ -4124,6 +4214,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn valltrue32x4(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u32x4();
         let result = a.iter().all(|a| *a != 0);
@@ -4131,6 +4222,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn valltrue64x2(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u64x2();
         let result = a.iter().all(|a| *a != 0);
@@ -4138,6 +4230,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vanytrue8x16(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u8x16();
         let result = a.iter().any(|a| *a != 0);
@@ -4145,6 +4238,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vanytrue16x8(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u16x8();
         let result = a.iter().any(|a| *a != 0);
@@ -4152,6 +4246,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vanytrue32x4(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u32x4();
         let result = a.iter().any(|a| *a != 0);
@@ -4159,6 +4254,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vanytrue64x2(&mut self, dst: XReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u64x2();
         let result = a.iter().any(|a| *a != 0);
@@ -4166,126 +4262,147 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vf32x4_from_i32x4_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i32x4();
         self.state[dst].set_f32x4(a.map(|i| i as f32));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vf32x4_from_i32x4_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u32x4();
         self.state[dst].set_f32x4(a.map(|i| i as f32));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vf64x2_from_i64x2_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i64x2();
         self.state[dst].set_f64x2(a.map(|i| i as f64));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vf64x2_from_i64x2_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u64x2();
         self.state[dst].set_f64x2(a.map(|i| i as f64));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vi32x4_from_f32x4_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f32x4();
         self.state[dst].set_i32x4(a.map(|f| f as i32));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vi32x4_from_f32x4_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f32x4();
         self.state[dst].set_u32x4(a.map(|f| f as u32));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vi64x2_from_f64x2_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f64x2();
         self.state[dst].set_i64x2(a.map(|f| f as i64));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vi64x2_from_f64x2_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f64x2();
         self.state[dst].set_u64x2(a.map(|f| f as u64));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow8x16_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i8x16().first_chunk().unwrap();
         self.state[dst].set_i16x8(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow8x16_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u8x16().first_chunk().unwrap();
         self.state[dst].set_u16x8(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow16x8_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i16x8().first_chunk().unwrap();
         self.state[dst].set_i32x4(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow16x8_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u16x8().first_chunk().unwrap();
         self.state[dst].set_u32x4(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow32x4_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i32x4().first_chunk().unwrap();
         self.state[dst].set_i64x2(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenlow32x4_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u32x4().first_chunk().unwrap();
         self.state[dst].set_u64x2(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh8x16_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i8x16().last_chunk().unwrap();
         self.state[dst].set_i16x8(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh8x16_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u8x16().last_chunk().unwrap();
         self.state[dst].set_u16x8(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh16x8_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i16x8().last_chunk().unwrap();
         self.state[dst].set_i32x4(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh16x8_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u16x8().last_chunk().unwrap();
         self.state[dst].set_u32x4(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh32x4_s(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_i32x4().last_chunk().unwrap();
         self.state[dst].set_i64x2(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vwidenhigh32x4_u(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = *self.state[src].get_u32x4().last_chunk().unwrap();
         self.state[dst].set_u64x2(a.map(|i| i.into()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow16x8_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4299,6 +4416,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow16x8_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4312,6 +4430,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow32x4_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4325,6 +4444,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow32x4_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4338,6 +4458,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow64x2_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4351,6 +4472,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnarrow64x2_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4364,6 +4486,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vunarrow64x2_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u64x2();
@@ -4375,18 +4498,21 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfpromotelow(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f32x4();
         self.state[dst].set_f64x2([a[0].into(), a[1].into()]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfdemote(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f64x2();
         self.state[dst].set_f32x4([a[0] as f32, a[1] as f32, 0.0, 0.0]);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4397,6 +4523,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4407,6 +4534,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4417,6 +4545,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4427,6 +4556,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi8x16_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4437,6 +4567,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubu8x16_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4447,6 +4578,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubi16x8_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4457,6 +4589,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubu16x8_sat(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -4467,6 +4600,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vsubf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -4477,6 +4611,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmuli8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4487,6 +4622,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmuli16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4497,6 +4633,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmuli32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4507,6 +4644,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmuli64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4517,6 +4655,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmulf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -4527,6 +4666,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vqmulrsi16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4540,48 +4680,56 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vpopcnt8x16(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_u8x16();
         self.state[dst].set_u8x16(a.map(|i| i.count_ones() as u8));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xextractv8x16(&mut self, dst: XReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_u8x16().get_unchecked(usize::from(lane)) };
         self.state[dst].set_u32(u32::from(a));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xextractv16x8(&mut self, dst: XReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_u16x8().get_unchecked(usize::from(lane)) };
         self.state[dst].set_u32(u32::from(a));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xextractv32x4(&mut self, dst: XReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_u32x4().get_unchecked(usize::from(lane)) };
         self.state[dst].set_u32(a);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xextractv64x2(&mut self, dst: XReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_u64x2().get_unchecked(usize::from(lane)) };
         self.state[dst].set_u64(a);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn fextractv32x4(&mut self, dst: FReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_f32x4().get_unchecked(usize::from(lane)) };
         self.state[dst].set_f32(a);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn fextractv64x2(&mut self, dst: FReg, src: VReg, lane: u8) -> ControlFlow<Done> {
         let a = unsafe { *self.state[src].get_f64x2().get_unchecked(usize::from(lane)) };
         self.state[dst].set_f64(a);
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertx8(
         &mut self,
         operands: BinaryOperands<VReg, VReg, XReg>,
@@ -4596,6 +4744,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertx16(
         &mut self,
         operands: BinaryOperands<VReg, VReg, XReg>,
@@ -4610,6 +4759,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertx32(
         &mut self,
         operands: BinaryOperands<VReg, VReg, XReg>,
@@ -4624,6 +4774,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertx64(
         &mut self,
         operands: BinaryOperands<VReg, VReg, XReg>,
@@ -4638,6 +4789,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertf32(
         &mut self,
         operands: BinaryOperands<VReg, VReg, FReg>,
@@ -4652,6 +4804,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vinsertf64(
         &mut self,
         operands: BinaryOperands<VReg, VReg, FReg>,
@@ -4666,6 +4819,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veq8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4677,6 +4831,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneq8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4688,6 +4843,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslt8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4699,6 +4855,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslteq8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4710,6 +4867,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vult8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4721,6 +4879,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vulteq8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4732,6 +4891,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veq16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -4743,6 +4903,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneq16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -4754,6 +4915,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslt16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4765,6 +4927,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslteq16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4776,6 +4939,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vult16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -4787,6 +4951,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vulteq16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -4798,6 +4963,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veq32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -4809,6 +4975,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneq32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -4820,6 +4987,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslt32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4831,6 +4999,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslteq32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -4842,6 +5011,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vult32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -4853,6 +5023,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vulteq32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -4864,6 +5035,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veq64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u64x2();
@@ -4875,6 +5047,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneq64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u64x2();
@@ -4886,6 +5059,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslt64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4897,6 +5071,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vslteq64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_i64x2();
         let b = self.state[operands.src2].get_i64x2();
@@ -4908,6 +5083,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vult64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u64x2();
@@ -4919,6 +5095,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vulteq64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_u64x2();
         let b = self.state[operands.src2].get_u64x2();
@@ -4930,36 +5107,42 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneg8x16(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i8x16();
         self.state[dst].set_i8x16(a.map(|i| i.wrapping_neg()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneg16x8(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i16x8();
         self.state[dst].set_i16x8(a.map(|i| i.wrapping_neg()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneg32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i32x4();
         self.state[dst].set_i32x4(a.map(|i| i.wrapping_neg()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneg64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i64x2();
         self.state[dst].set_i64x2(a.map(|i| i.wrapping_neg()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vnegf64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f64x2();
         self.state[dst].set_f64x2(a.map(|i| -i));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin8x16_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -4970,6 +5153,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin8x16_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -4980,6 +5164,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin16x8_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -4990,6 +5175,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin16x8_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -5000,6 +5186,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin32x4_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -5010,6 +5197,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmin32x4_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -5020,6 +5208,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax8x16_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i8x16();
         let b = self.state[operands.src2].get_i8x16();
@@ -5030,6 +5219,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax8x16_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -5040,6 +5230,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax16x8_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i16x8();
         let b = self.state[operands.src2].get_i16x8();
@@ -5050,6 +5241,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax16x8_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -5060,6 +5252,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax32x4_s(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_i32x4();
         let b = self.state[operands.src2].get_i32x4();
@@ -5070,6 +5263,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmax32x4_u(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u32x4();
         let b = self.state[operands.src2].get_u32x4();
@@ -5080,42 +5274,49 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabs8x16(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i8x16();
         self.state[dst].set_i8x16(a.map(|i| i.wrapping_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabs16x8(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i16x8();
         self.state[dst].set_i16x8(a.map(|i| i.wrapping_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabs32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i32x4();
         self.state[dst].set_i32x4(a.map(|i| i.wrapping_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabs64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_i64x2();
         self.state[dst].set_i64x2(a.map(|i| i.wrapping_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabsf32x4(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f32x4();
         self.state[dst].set_f32x4(a.map(|i| i.wasm_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vabsf64x2(&mut self, dst: VReg, src: VReg) -> ControlFlow<Done> {
         let a = self.state[src].get_f64x2();
         self.state[dst].set_f64x2(a.map(|i| i.wasm_abs()));
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmaximumf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5126,6 +5327,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vmaximumf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5136,6 +5338,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vminimumf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5146,6 +5349,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vminimumf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5156,6 +5360,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vshuffle(&mut self, dst: VReg, src1: VReg, src2: VReg, mask: u128) -> ControlFlow<Done> {
         let a = self.state[src1].get_u8x16();
         let b = self.state[src2].get_u8x16();
@@ -5170,6 +5375,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vswizzlei8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let src1 = self.state[operands.src1].get_i8x16();
         let src2 = self.state[operands.src2].get_i8x16();
@@ -5185,6 +5391,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vavground8x16(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u8x16();
         let b = self.state[operands.src2].get_u8x16();
@@ -5196,6 +5403,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vavground16x8(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let mut a = self.state[operands.src1].get_u16x8();
         let b = self.state[operands.src2].get_u16x8();
@@ -5207,6 +5415,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veqf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5218,6 +5427,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneqf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5229,6 +5439,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vltf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5240,6 +5451,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vlteqf32x4(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f32x4();
         let b = self.state[operands.src2].get_f32x4();
@@ -5251,6 +5463,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn veqf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5262,6 +5475,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vneqf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5273,6 +5487,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vltf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5284,6 +5499,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vlteqf64x2(&mut self, operands: BinaryOperands<VReg>) -> ControlFlow<Done> {
         let a = self.state[operands.src1].get_f64x2();
         let b = self.state[operands.src2].get_f64x2();
@@ -5295,6 +5511,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfma32x4(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) -> ControlFlow<Done> {
         let mut a = self.state[a].get_f32x4();
         let b = self.state[b].get_f32x4();
@@ -5306,6 +5523,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vfma64x2(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) -> ControlFlow<Done> {
         let mut a = self.state[a].get_f64x2();
         let b = self.state[b].get_f64x2();
@@ -5317,6 +5535,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn vselect(
         &mut self,
         dst: VReg,
@@ -5333,6 +5552,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xadd128(
         &mut self,
         dst_lo: XReg,
@@ -5349,6 +5569,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xsub128(
         &mut self,
         dst_lo: XReg,
@@ -5365,6 +5586,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xwidemul64_s(
         &mut self,
         dst_lo: XReg,
@@ -5379,6 +5601,7 @@ impl ExtendedOpVisitor for Interpreter<'_> {
         ControlFlow::Continue(())
     }
 
+    #[interp_disable_if_cfg(pulley_disable_interp_simd)]
     fn xwidemul64_u(
         &mut self,
         dst_lo: XReg,

@@ -76,7 +76,7 @@ fn pulley_roundtrip(u: Unstructured<'_>) -> Result<()> {
 }
 
 fn assembler_roundtrip(u: Unstructured<'_>) -> Result<()> {
-    use cranelift_assembler_x64::{fuzz, Inst};
+    use cranelift_assembler_x64::{Inst, fuzz};
     let inst: Inst<fuzz::FuzzRegs> = Arbitrary::arbitrary_take_rest(u)?;
     fuzz::roundtrip(&inst);
     Ok(())
@@ -108,7 +108,7 @@ fn dominator_tree(mut data: Unstructured<'_>) -> Result<()> {
     use cranelift_codegen::dominator_tree::{DominatorTree, SimpleDominatorTree};
     use cranelift_codegen::flowgraph::ControlFlowGraph;
     use cranelift_codegen::ir::{
-        types::I32, Block, BlockCall, Function, InstBuilder, JumpTableData, Value,
+        Block, BlockCall, Function, InstBuilder, JumpTableData, Value, types::I32,
     };
     use std::collections::HashMap;
 
@@ -158,7 +158,9 @@ fn dominator_tree(mut data: Unstructured<'_>) -> Result<()> {
             } else {
                 let block_calls = children
                     .iter()
-                    .map(|&block| BlockCall::new(block, &[], &mut cursor.func.dfg.value_lists))
+                    .map(|&block| {
+                        BlockCall::new(block, core::iter::empty(), &mut cursor.func.dfg.value_lists)
+                    })
                     .collect::<Vec<_>>();
 
                 let data = JumpTableData::new(block_calls[0], &block_calls[1..]);

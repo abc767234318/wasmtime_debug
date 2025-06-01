@@ -6,8 +6,6 @@ use core::str::FromStr;
 #[cfg(any(feature = "cache", feature = "cranelift", feature = "winch"))]
 use std::path::Path;
 use wasmparser::WasmFeatures;
-#[cfg(feature = "cache")]
-use wasmtime_cache::CacheConfig;
 use wasmtime_environ::{ConfigTunables, TripleExt, Tunables};
 
 #[cfg(feature = "runtime")]
@@ -28,6 +26,8 @@ use wasmtime_fiber::RuntimeFiberStackCreator;
 
 #[cfg(feature = "runtime")]
 pub use crate::runtime::code_memory::CustomCodeMemory;
+#[cfg(feature = "cache")]
+pub use wasmtime_cache::{Cache, CacheConfig};
 #[cfg(all(feature = "incremental-cache", feature = "cranelift"))]
 pub use wasmtime_environ::CacheStore;
 
@@ -128,7 +128,7 @@ pub struct Config {
     tunables: ConfigTunables,
 
     #[cfg(feature = "cache")]
-    pub(crate) cache_config: CacheConfig,
+    pub(crate) cache: Option<Cache>,
     #[cfg(feature = "runtime")]
     pub(crate) mem_creator: Option<Arc<dyn RuntimeMemoryCreator>>,
     #[cfg(feature = "runtime")]
@@ -231,7 +231,7 @@ impl Config {
             #[cfg(feature = "gc")]
             collector: Collector::default(),
             #[cfg(feature = "cache")]
-            cache_config: CacheConfig::new_cache_disabled(),
+            cache: None,
             profiling_strategy: ProfilingStrategy::None,
             #[cfg(feature = "runtime")]
             mem_creator: None,
@@ -279,10 +279,9 @@ impl Config {
 
             // When running under MIRI try to optimize for compile time of wasm
             // code itself as much as possible. Disable optimizations by
-            // default and use the fastest regalloc available to us.
+            // default.
             if cfg!(miri) {
                 ret.cranelift_opt_level(OptLevel::None);
-                ret.cranelift_regalloc_algorithm(RegallocAlgorithm::SinglePass);
             }
         }
 
@@ -380,7 +379,7 @@ impl Config {
     /// arbitrarily long in the worst case, likely blocking all other
     /// asynchronous tasks.
     ///
-    /// To remedy this situation you have a a few possible ways to solve this:
+    /// To remedy this situation you have a few possible ways to solve this:
     ///
     /// * The most efficient solution is to enable
     ///   [`Config::epoch_interruption`] in conjunction with
@@ -491,9 +490,9 @@ impl Config {
             WasmBacktraceDetails::Enable => Some(true),
             WasmBacktraceDetails::Disable => Some(false),
             WasmBacktraceDetails::Environment => {
-                self.wasm_backtrace_details_env_used = true;
                 #[cfg(feature = "std")]
                 {
+                    self.wasm_backtrace_details_env_used = true;
                     std::env::var("WASMTIME_BACKTRACE_DETAILS")
                         .map(|s| Some(s == "1"))
                         .unwrap_or(Some(false))
@@ -849,6 +848,21 @@ impl Config {
         self
     }
 
+    /// Configures whether the WebAssembly [shared-everything-threads] proposal
+    /// will be enabled for compilation.
+    ///
+    /// This feature gates extended use of the `shared` attribute on items other
+    /// than memories, extra atomic instructions, and new component model
+    /// intrinsics for spawning threads. It depends on the
+    /// [`wasm_threads`][Self::wasm_threads] being enabled.
+    ///
+    /// [shared-everything-threads]:
+    ///     https://github.com/webassembly/shared-everything-threads
+    pub fn wasm_shared_everything_threads(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::SHARED_EVERYTHING_THREADS, enable);
+        self
+    }
+
     /// Configures whether the [WebAssembly reference types proposal][proposal]
     /// will be enabled for compilation.
     ///
@@ -1082,13 +1096,7 @@ impl Config {
     ///
     /// [proposal]: https://github.com/webassembly/stack-switching
     pub fn wasm_stack_switching(&mut self, enable: bool) -> &mut Self {
-        // FIXME(dhil): Once the config provides a handle
-        // for turning on/off exception handling proposal support,
-        // this ought to only enable stack switching.
-        self.wasm_feature(
-            WasmFeatures::EXCEPTIONS | WasmFeatures::STACK_SWITCHING,
-            enable,
-        );
+        self.wasm_feature(WasmFeatures::STACK_SWITCHING, enable);
         self
     }
 
@@ -1115,12 +1123,66 @@ impl Config {
     /// lifting and lowering functions, as well as `stream`, `future`, and
     /// `error-context` types.
     ///
-    /// Please note that Wasmtime's support for this feature is _very_ incomplete.
+    /// Please note that Wasmtime's support for this feature is _very_
+    /// incomplete.
+    ///
+    /// [proposal]:
+    ///     https://github.com/WebAssembly/component-model/blob/main/design/mvp/Async.md
+    #[cfg(feature = "component-model-async")]
+    pub fn wasm_component_model_async(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::CM_ASYNC, enable);
+        self
+    }
+
+    /// This corresponds to the 🚝 emoji in the component model specification.
+    ///
+    /// Please note that Wasmtime's support for this feature is _very_
+    /// incomplete.
+    ///
+    /// [proposal]:
+    ///     https://github.com/WebAssembly/component-model/blob/main/design/mvp/Async.md
+    #[cfg(feature = "component-model-async")]
+    pub fn wasm_component_model_async_builtins(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::CM_ASYNC_BUILTINS, enable);
+        self
+    }
+
+    /// This corresponds to the 🚟 emoji in the component model specification.
+    ///
+    /// Please note that Wasmtime's support for this feature is _very_
+    /// incomplete.
     ///
     /// [proposal]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Async.md
     #[cfg(feature = "component-model-async")]
-    pub fn wasm_component_model_async(&mut self, enable: bool) -> &mut Self {
-        self.wasm_feature(WasmFeatures::COMPONENT_MODEL_ASYNC, enable);
+    pub fn wasm_component_model_async_stackful(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::CM_ASYNC_STACKFUL, enable);
+        self
+    }
+
+    /// This corresponds to the 📝 emoji in the component model specification.
+    ///
+    /// Please note that Wasmtime's support for this feature is _very_
+    /// incomplete.
+    ///
+    /// [proposal]: https://github.com/WebAssembly/component-model/blob/main/design/mvp/Async.md
+    #[cfg(feature = "component-model")]
+    pub fn wasm_component_model_error_context(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::CM_ERROR_CONTEXT, enable);
+        self
+    }
+
+    #[doc(hidden)] // FIXME(#3427) - if/when implemented then un-hide this
+    pub fn wasm_exceptions(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::EXCEPTIONS, enable);
+        self
+    }
+
+    #[doc(hidden)] // FIXME(#3427) - if/when implemented then un-hide this
+    #[deprecated = "This configuration option only exists for internal \
+                    usage with the spec testsuite. It may be removed at \
+                    any time and without warning. Do not rely on it!"]
+    pub fn wasm_legacy_exceptions(&mut self, enable: bool) -> &mut Self {
+        self.wasm_feature(WasmFeatures::LEGACY_EXCEPTIONS, enable);
         self
     }
 
@@ -1219,7 +1281,6 @@ impl Config {
     pub fn cranelift_regalloc_algorithm(&mut self, algo: RegallocAlgorithm) -> &mut Self {
         let val = match algo {
             RegallocAlgorithm::Backtracking => "backtracking",
-            RegallocAlgorithm::SinglePass => "single_pass",
         };
         self.compiler_config
             .settings
@@ -1320,71 +1381,25 @@ impl Config {
         self
     }
 
-    /// Loads cache configuration specified at `path`.
+    /// Set a custom [`Cache`].
     ///
-    /// This method will read the file specified by `path` on the filesystem and
-    /// attempt to load cache configuration from it. This method can also fail
-    /// due to I/O errors, misconfiguration, syntax errors, etc. For expected
-    /// syntax in the configuration file see the [documentation online][docs].
+    /// To load a cache from a file, use [`Cache::from_file`]. Otherwise, you can create a new
+    /// cache config using [`CacheConfig::new`] and passing that to [`Cache::new`].
     ///
-    /// By default cache configuration is not enabled or loaded.
+    /// If you want to disable the cache, you can call this method with `None`.
+    ///
+    /// By default, new configs do not have caching enabled.
+    /// Every call to [`Module::new(my_wasm)`][crate::Module::new] will recompile `my_wasm`,
+    /// even when it is unchanged, unless an enabled `CacheConfig` is provided.
     ///
     /// This method is only available when the `cache` feature of this crate is
     /// enabled.
-    ///
-    /// # Errors
-    ///
-    /// This method can fail due to any error that happens when loading the file
-    /// pointed to by `path` and attempting to load the cache configuration.
     ///
     /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
     #[cfg(feature = "cache")]
-    pub fn cache_config_load(&mut self, path: impl AsRef<Path>) -> Result<&mut Self> {
-        self.cache_config = CacheConfig::from_file(Some(path.as_ref()))?;
-        Ok(self)
-    }
-
-    /// Disable caching.
-    ///
-    /// Every call to [`Module::new(my_wasm)`][crate::Module::new] will
-    /// recompile `my_wasm`, even when it is unchanged.
-    ///
-    /// By default, new configs do not have caching enabled. This method is only
-    /// useful for disabling a previous cache configuration.
-    ///
-    /// This method is only available when the `cache` feature of this crate is
-    /// enabled.
-    #[cfg(feature = "cache")]
-    pub fn disable_cache(&mut self) -> &mut Self {
-        self.cache_config = CacheConfig::new_cache_disabled();
+    pub fn cache(&mut self, cache: Option<Cache>) -> &mut Self {
+        self.cache = cache;
         self
-    }
-
-    /// Loads cache configuration from the system default path.
-    ///
-    /// This commit is the same as [`Config::cache_config_load`] except that it
-    /// does not take a path argument and instead loads the default
-    /// configuration present on the system. This is located, for example, on
-    /// Unix at `$HOME/.config/wasmtime/config.toml` and is typically created
-    /// with the `wasmtime config new` command.
-    ///
-    /// By default cache configuration is not enabled or loaded.
-    ///
-    /// This method is only available when the `cache` feature of this crate is
-    /// enabled.
-    ///
-    /// # Errors
-    ///
-    /// This method can fail due to any error that happens when loading the
-    /// default system configuration. Note that it is not an error if the
-    /// default config file does not exist, in which case the default settings
-    /// for an enabled cache are applied.
-    ///
-    /// [docs]: https://bytecodealliance.github.io/wasmtime/cli-cache.html
-    #[cfg(feature = "cache")]
-    pub fn cache_config_load_default(&mut self) -> Result<&mut Self> {
-        self.cache_config = CacheConfig::from_file(None)?;
-        Ok(self)
     }
 
     /// Sets a custom memory creator.
@@ -1512,8 +1527,8 @@ impl Config {
     ///
     /// Memory in the `initial` range is accessible to the instance and can be
     /// read/written by wasm code. Memory in the `guard` regions is never
-    /// accesible to wasm code and memory in `capacity` is initially
-    /// inaccessible but may become accesible through `memory.grow` instructions
+    /// accessible to wasm code and memory in `capacity` is initially
+    /// inaccessible but may become accessible through `memory.grow` instructions
     /// for example.
     ///
     /// This means that this setting is the size of the initial chunk of virtual
@@ -1525,7 +1540,7 @@ impl Config {
     /// during the compilation process of a WebAssembly module. For example if a
     /// 32-bit WebAssembly linear memory has a `memory_reservation` size of 4GiB
     /// then bounds checks can be elided because `capacity` will be guaranteed
-    /// to be unmapped for all addressible bytes that wasm can access (modulo a
+    /// to be unmapped for all addressable bytes that wasm can access (modulo a
     /// few details).
     ///
     /// If `memory_reservation` was something smaller like 256KiB then that
@@ -1537,7 +1552,7 @@ impl Config {
     /// modules by default. Some situations which require explicit bounds checks
     /// though are:
     ///
-    /// * When `memory_reservation` is smaller than the addressible size of the
+    /// * When `memory_reservation` is smaller than the addressable size of the
     ///   linear memory. For example if 64-bit linear memories always need
     ///   bounds checks as they can address the entire virtual address spacce.
     ///   For 32-bit linear memories a `memory_reservation` minimum size of 4GiB
@@ -2020,33 +2035,30 @@ impl Config {
         #[cfg(any(feature = "cranelift", feature = "winch"))]
         match self.compiler_config.strategy {
             None | Some(Strategy::Cranelift) => {
+                let mut unsupported = WasmFeatures::empty();
+
                 // Pulley at this time fundamentally doesn't support the
                 // `threads` proposal, notably shared memory, because Rust can't
                 // safely implement loads/stores in the face of shared memory.
                 if self.compiler_target().is_pulley() {
-                    return WasmFeatures::THREADS;
+                    unsupported |= WasmFeatures::THREADS;
                 }
 
-                // Other Cranelift backends are either 100% missing or complete
-                // at this time, so no need to further filter.
-                WasmFeatures::empty()
+                unsupported
             }
             Some(Strategy::Winch) => {
                 let mut unsupported = WasmFeatures::GC
                     | WasmFeatures::FUNCTION_REFERENCES
                     | WasmFeatures::RELAXED_SIMD
                     | WasmFeatures::TAIL_CALL
-                    | WasmFeatures::GC_TYPES;
+                    | WasmFeatures::GC_TYPES
+                    | WasmFeatures::EXCEPTIONS
+                    | WasmFeatures::LEGACY_EXCEPTIONS;
                 match self.compiler_target().architecture {
                     target_lexicon::Architecture::Aarch64(_) => {
-                        // no support for simd on aarch64
                         unsupported |= WasmFeatures::SIMD;
-
-                        // things like multi-table are technically supported on
-                        // winch on aarch64 but this helps gate most spec tests
-                        // by default which otherwise currently cause panics.
-                        unsupported |= WasmFeatures::REFERENCE_TYPES;
-                        unsupported |= WasmFeatures::THREADS
+                        unsupported |= WasmFeatures::THREADS;
+                        unsupported |= WasmFeatures::WIDE_ARITHMETIC;
                     }
 
                     // Winch doesn't support other non-x64 architectures at this
@@ -2116,7 +2128,6 @@ impl Config {
     /// Returns the configured compiler target for this `Config`.
     pub(crate) fn compiler_target(&self) -> target_lexicon::Triple {
         // If a target is explicitly configured, always use that.
-        #[cfg(any(feature = "cranelift", feature = "winch"))]
         if let Some(target) = self.target.clone() {
             return target;
         }
@@ -2369,7 +2380,9 @@ impl Config {
                 .compiler_config
                 .ensure_setting_unset_or_given("unwind_info", &unwind_requested.to_string())
             {
-                bail!("incompatible settings requested for Cranelift and Wasmtime `unwind-info` settings");
+                bail!(
+                    "incompatible settings requested for Cranelift and Wasmtime `unwind-info` settings"
+                );
             }
         }
 
@@ -2390,14 +2403,13 @@ impl Config {
             .insert("preserve_frame_pointers".into(), "true".into());
 
         if !tunables.signals_based_traps {
-            let mut ok = self.compiler_config.ensure_setting_unset_or_given(
-                "enable_table_access_spectre_mitigation".into(),
-                "false".into(),
-            );
+            let mut ok = self
+                .compiler_config
+                .ensure_setting_unset_or_given("enable_table_access_spectre_mitigation", "false");
             ok = ok
                 && self.compiler_config.ensure_setting_unset_or_given(
-                    "enable_heap_access_spectre_mitigation".into(),
-                    "false".into(),
+                    "enable_heap_access_spectre_mitigation",
+                    "false",
                 );
 
             // Right now spectre-mitigated bounds checks will load from zero so
@@ -2418,7 +2430,9 @@ impl Config {
                 .compiler_config
                 .ensure_setting_unset_or_given("enable_safepoints", "true")
             {
-                bail!("compiler option 'enable_safepoints' must be enabled when 'reference types' is enabled");
+                bail!(
+                    "compiler option 'enable_safepoints' must be enabled when 'reference types' is enabled"
+                );
             }
         }
 
@@ -2803,16 +2817,6 @@ pub enum RegallocAlgorithm {
     /// results in better register utilization, producing fewer spills
     /// and moves, but can cause super-linear compile runtime.
     Backtracking,
-    /// Generates acceptable code very quickly.
-    ///
-    /// This algorithm performs a single pass through the code,
-    /// guaranteed to work in linear time.  (Note that the rest of
-    /// Cranelift is not necessarily guaranteed to run in linear time,
-    /// however.) It cannot undo earlier decisions, however, and it
-    /// cannot foresee constraints or issues that may occur further
-    /// ahead in the code, so the code may have more spills and moves as
-    /// a result.
-    SinglePass,
 }
 
 /// Select which profiling technique to support.

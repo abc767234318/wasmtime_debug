@@ -8,7 +8,7 @@
 use super::sys::DecommitBehavior;
 use crate::prelude::*;
 use crate::runtime::vm::sys::vm::{self, MemoryImageSource};
-use crate::runtime::vm::{host_page_size, HostAlignedByteCount, MmapOffset, MmapVec};
+use crate::runtime::vm::{HostAlignedByteCount, MmapOffset, MmapVec, host_page_size};
 use alloc::sync::Arc;
 use core::ops::Range;
 use core::ptr;
@@ -406,7 +406,12 @@ impl MemoryImageSlot {
         tunables: &Tunables,
     ) -> Result<()> {
         assert!(!self.dirty);
-        assert!(initial_size_bytes <= self.static_size);
+        assert!(
+            initial_size_bytes <= self.static_size,
+            "initial_size_bytes <= self.static_size failed: \
+             initial_size_bytes={initial_size_bytes}, self.static_size={}",
+            self.static_size
+        );
         let initial_size_bytes_page_aligned =
             HostAlignedByteCount::new_rounded_up(initial_size_bytes)?;
 
@@ -786,7 +791,7 @@ mod test {
     use super::*;
     use crate::runtime::vm::mmap::{AlignedLength, Mmap};
     use crate::runtime::vm::sys::vm::decommit_pages;
-    use crate::runtime::vm::{host_page_size, HostAlignedByteCount};
+    use crate::runtime::vm::{HostAlignedByteCount, host_page_size};
     use std::sync::Arc;
     use wasmtime_environ::{IndexType, Limits, Memory};
 

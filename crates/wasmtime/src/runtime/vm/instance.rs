@@ -8,16 +8,16 @@ use crate::runtime::vm::memory::{Memory, RuntimeMemoryCreator};
 use crate::runtime::vm::table::{Table, TableElement, TableElementType};
 use crate::runtime::vm::vmcontext::{
     VMBuiltinFunctionsArray, VMContext, VMFuncRef, VMFunctionImport, VMGlobalDefinition,
-    VMGlobalImport, VMMemoryDefinition, VMMemoryImport, VMOpaqueContext, VMStoreContext,
-    VMTableDefinition, VMTableImport, VMTagDefinition, VMTagImport,
+    VMGlobalImport, VMMemoryDefinition, VMMemoryImport, VMOpaqueContext, VMStoreContext, VMTable,
+    VMTableDefinition, VMTagDefinition, VMTagImport,
 };
 use crate::runtime::vm::{
     ExportFunction, ExportGlobal, ExportMemory, ExportTable, ExportTag, GcStore, Imports,
     ModuleRuntimeInfo, SendSyncPtr, VMFunctionBody, VMGcRef, VMStore, VMStoreRawPtr, VmPtr, VmSafe,
     WasmFault,
 };
-use crate::store::{StoreInner, StoreOpaque};
-use crate::{prelude::*, StoreContextMut};
+use crate::store::{InstanceId, StoreInner, StoreOpaque};
+use crate::{StoreContextMut, prelude::*};
 use alloc::sync::Arc;
 use core::alloc::Layout;
 use core::any::Any;
@@ -26,15 +26,14 @@ use core::ptr::NonNull;
 #[cfg(target_has_atomic = "64")]
 use core::sync::atomic::AtomicU64;
 use core::{mem, ptr};
-use sptr::Strict;
 #[cfg(feature = "gc")]
 use wasmtime_environ::ModuleInternedTypeIndex;
 use wasmtime_environ::{
-    packed_option::ReservedValue, DataIndex, DefinedGlobalIndex, DefinedMemoryIndex,
-    DefinedTableIndex, DefinedTagIndex, ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex,
-    GlobalIndex, HostPtr, MemoryIndex, Module, PrimaryMap, PtrSize, TableIndex, TableInitialValue,
-    TableSegmentElements, TagIndex, Trap, VMOffsets, VMSharedTypeIndex, WasmHeapTopType,
-    VMCONTEXT_MAGIC,
+    DataIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, DefinedTagIndex,
+    ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex, GlobalIndex, HostPtr, MemoryIndex,
+    Module, PrimaryMap, PtrSize, TableIndex, TableInitialValue, TableSegmentElements, TagIndex,
+    Trap, VMCONTEXT_MAGIC, VMOffsets, VMSharedTypeIndex, WasmHeapTopType,
+    packed_option::ReservedValue,
 };
 #[cfg(feature = "wmemcheck")]
 use wasmtime_wmemcheck::Wmemcheck;
@@ -185,6 +184,9 @@ impl InstanceAndStore {
 /// values, whether or not they were created on the host or through a module.
 #[repr(C)] // ensure that the vmctx field is last.
 pub struct Instance {
+    /// The index, within a `Store` that this instance lives at
+    id: InstanceId,
+
     /// The runtime info (corresponding to the "compiled module"
     /// abstraction in higher layers) that is retained and needed for
     /// lazy initialization. This provides access to the underlying
@@ -318,6 +320,7 @@ impl Instance {
         ptr::write(
             ptr,
             Instance {
+                id: req.id,
                 runtime_info: req.runtime_info.clone(),
                 memories,
                 tables,
@@ -428,8 +431,8 @@ impl Instance {
         unsafe { &*self.vmctx_plus_offset(self.offsets().vmctx_vmfunction_import(index)) }
     }
 
-    /// Return the index `VMTableImport`.
-    fn imported_table(&self, index: TableIndex) -> &VMTableImport {
+    /// Return the index `VMTable`.
+    fn imported_table(&self, index: TableIndex) -> &VMTable {
         unsafe { &*self.vmctx_plus_offset(self.offsets().vmctx_vmtable_import(index)) }
     }
 
@@ -497,8 +500,9 @@ impl Instance {
         }
     }
 
-    /// Return the indexed `VMMemoryDefinition`.
-    fn memory(&self, index: DefinedMemoryIndex) -> VMMemoryDefinition {
+    /// Return the indexed `VMMemoryDefinition`, loaded from vmctx memory
+    /// already.
+    pub fn memory(&self, index: DefinedMemoryIndex) -> VMMemoryDefinition {
         unsafe { VMMemoryDefinition::load(self.memory_ptr(index).as_ptr()) }
     }
 
@@ -509,8 +513,11 @@ impl Instance {
         }
     }
 
-    /// Return the indexed `VMMemoryDefinition`.
-    fn memory_ptr(&self, index: DefinedMemoryIndex) -> NonNull<VMMemoryDefinition> {
+    /// Return the address of the specified memory at `index` within this vmctx.
+    ///
+    /// Note that the returned pointer resides in wasm-code-readable-memory in
+    /// the vmctx.
+    pub fn memory_ptr(&self, index: DefinedMemoryIndex) -> NonNull<VMMemoryDefinition> {
         let vmptr = unsafe {
             *self.vmctx_plus_offset::<VmPtr<_>>(self.offsets().vmctx_vmmemory_pointer(index))
         };
@@ -583,23 +590,13 @@ impl Instance {
     /// Return a pointer to the interrupts structure
     #[inline]
     pub fn vm_store_context(&mut self) -> NonNull<Option<VmPtr<VMStoreContext>>> {
-        unsafe { self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_runtime_limits()) }
+        unsafe { self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_store_context()) }
     }
 
     /// Return a pointer to the global epoch counter used by this instance.
     #[cfg(target_has_atomic = "64")]
     pub fn epoch_ptr(&mut self) -> NonNull<Option<VmPtr<AtomicU64>>> {
         unsafe { self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_epoch_ptr()) }
-    }
-
-    /// Return a pointer to the GC heap base pointer.
-    pub fn gc_heap_base(&mut self) -> NonNull<Option<VmPtr<u8>>> {
-        unsafe { self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_gc_heap_base()) }
-    }
-
-    /// Return a pointer to the GC heap bound.
-    pub fn gc_heap_bound(&mut self) -> NonNull<usize> {
-        unsafe { self.vmctx_plus_offset_mut(self.offsets().ptr.vmctx_gc_heap_bound()) }
     }
 
     /// Return a pointer to the collector-specific heap data.
@@ -616,7 +613,15 @@ impl Instance {
             #[cfg(target_has_atomic = "64")]
             self.epoch_ptr()
                 .write(Some(NonNull::from(store.engine().epoch_counter()).into()));
-            self.set_gc_heap(store.gc_store_mut().ok());
+
+            if self.env_module().needs_gc_heap {
+                self.set_gc_heap(Some(store.gc_store().expect(
+                    "if we need a GC heap, then `Instance::new_raw` should have already \
+                     allocated it for us",
+                )));
+            } else {
+                self.set_gc_heap(None);
+            }
         } else {
             self.vm_store_context().write(None);
             #[cfg(target_has_atomic = "64")]
@@ -625,17 +630,11 @@ impl Instance {
         }
     }
 
-    unsafe fn set_gc_heap(&mut self, gc_store: Option<&mut GcStore>) {
+    unsafe fn set_gc_heap(&mut self, gc_store: Option<&GcStore>) {
         if let Some(gc_store) = gc_store {
-            let heap = gc_store.gc_heap.heap_slice_mut();
-            self.gc_heap_bound().write(heap.len());
-            self.gc_heap_base()
-                .write(Some(NonNull::from(heap).cast().into()));
             self.gc_heap_data()
                 .write(Some(gc_store.gc_heap.vmctx_gc_heap_data().into()));
         } else {
-            self.gc_heap_bound().write(0);
-            self.gc_heap_base().write(None);
             self.gc_heap_data().write(None);
         }
     }
@@ -664,13 +663,8 @@ impl Instance {
         // (there's an actual load of the field) it does look like that by the
         // time the backend runs. (that's magic to me, the backend removing
         // loads...)
-        //
-        // As a final minor note, strict provenance APIs are not stable on Rust
-        // today so the `sptr` crate is used. This crate provides the extension
-        // trait `Strict` but the method names conflict with the nightly methods
-        // so a different syntax is used to invoke methods here.
         let addr = &raw const self.vmctx;
-        let ret = Strict::with_addr(self.vmctx_self_reference.as_ptr(), Strict::addr(addr));
+        let ret = self.vmctx_self_reference.as_ptr().with_addr(addr.addr());
         NonNull::new(ret).unwrap()
     }
 
@@ -1512,6 +1506,11 @@ impl Instance {
         }
         fault
     }
+
+    /// Returns the id, within this instance's store, that it's assigned.
+    pub fn id(&self) -> InstanceId {
+        self.id
+    }
 }
 
 /// A handle holding an `Instance` of a WebAssembly module.
@@ -1704,8 +1703,8 @@ impl InstanceHandle {
     ///
     /// This is provided for the original `Store` itself to configure the first
     /// self-pointer after the original `Box` has been initialized.
-    pub unsafe fn set_store(&mut self, store: NonNull<dyn VMStore>) {
-        self.instance_mut().set_store(Some(store));
+    pub unsafe fn set_store(&mut self, store: Option<NonNull<dyn VMStore>>) {
+        self.instance_mut().set_store(store);
     }
 
     /// Returns a clone of this instance.

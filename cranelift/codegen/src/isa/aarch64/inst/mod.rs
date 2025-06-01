@@ -1,16 +1,17 @@
 //! This module defines aarch64-specific machine instruction types.
 
 use crate::binemit::{Addend, CodeOffset, Reloc};
-use crate::ir::types::{F128, F16, F32, F64, I128, I16, I32, I64, I8, I8X16};
-use crate::ir::{types, MemFlags, Type};
+use crate::ir::types::{F16, F32, F64, F128, I8, I8X16, I16, I32, I64, I128};
+use crate::ir::{MemFlags, Type, types};
 use crate::isa::{CallConv, FunctionAlignment};
 use crate::machinst::*;
-use crate::{settings, CodegenError, CodegenResult};
+use crate::{CodegenError, CodegenResult, settings};
 
 use crate::machinst::{PrettyPrint, Reg, RegClass, Writable};
 
 use alloc::vec::Vec;
-use smallvec::{smallvec, SmallVec};
+use core::slice;
+use smallvec::{SmallVec, smallvec};
 use std::fmt::Write;
 use std::string::{String, ToString};
 
@@ -231,31 +232,17 @@ impl Inst {
                 mem,
                 flags,
             },
-            F16 => Inst::FpuLoad16 {
-                rd: into_reg,
-                mem,
-                flags,
-            },
-            F32 => Inst::FpuLoad32 {
-                rd: into_reg,
-                mem,
-                flags,
-            },
-            F64 => Inst::FpuLoad64 {
-                rd: into_reg,
-                mem,
-                flags,
-            },
             _ => {
                 if ty.is_vector() || ty.is_float() {
                     let bits = ty_bits(ty);
                     let rd = into_reg;
 
-                    if bits == 128 {
-                        Inst::FpuLoad128 { rd, mem, flags }
-                    } else {
-                        assert_eq!(bits, 64);
-                        Inst::FpuLoad64 { rd, mem, flags }
+                    match bits {
+                        128 => Inst::FpuLoad128 { rd, mem, flags },
+                        64 => Inst::FpuLoad64 { rd, mem, flags },
+                        32 => Inst::FpuLoad32 { rd, mem, flags },
+                        16 => Inst::FpuLoad16 { rd, mem, flags },
+                        _ => unimplemented!("gen_load({})", ty),
                     }
                 } else {
                     unimplemented!("gen_load({})", ty);
@@ -287,31 +274,17 @@ impl Inst {
                 mem,
                 flags,
             },
-            F16 => Inst::FpuStore16 {
-                rd: from_reg,
-                mem,
-                flags,
-            },
-            F32 => Inst::FpuStore32 {
-                rd: from_reg,
-                mem,
-                flags,
-            },
-            F64 => Inst::FpuStore64 {
-                rd: from_reg,
-                mem,
-                flags,
-            },
             _ => {
                 if ty.is_vector() || ty.is_float() {
                     let bits = ty_bits(ty);
                     let rd = from_reg;
 
-                    if bits == 128 {
-                        Inst::FpuStore128 { rd, mem, flags }
-                    } else {
-                        assert_eq!(bits, 64);
-                        Inst::FpuStore64 { rd, mem, flags }
+                    match bits {
+                        128 => Inst::FpuStore128 { rd, mem, flags },
+                        64 => Inst::FpuStore64 { rd, mem, flags },
+                        32 => Inst::FpuStore32 { rd, mem, flags },
+                        16 => Inst::FpuStore16 { rd, mem, flags },
+                        _ => unimplemented!("gen_store({})", ty),
                     }
                 } else {
                     unimplemented!("gen_store({})", ty);
@@ -839,8 +812,11 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
             }
-            for CallRetPair { vreg, preg } in defs {
-                collector.reg_fixed_def(vreg, *preg);
+            for CallRetPair { vreg, location } in defs {
+                match location {
+                    RetLocation::Reg(preg, ..) => collector.reg_fixed_def(vreg, *preg),
+                    RetLocation::Stack(..) => collector.any_def(vreg),
+                }
             }
             collector.reg_clobbers(info.clobbers);
         }
@@ -852,8 +828,11 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
             }
-            for CallRetPair { vreg, preg } in defs {
-                collector.reg_fixed_def(vreg, *preg);
+            for CallRetPair { vreg, location } in defs {
+                match location {
+                    RetLocation::Reg(preg, ..) => collector.reg_fixed_def(vreg, *preg),
+                    RetLocation::Stack(..) => collector.any_def(vreg),
+                }
             }
             collector.reg_clobbers(info.clobbers);
         }
@@ -926,7 +905,7 @@ fn aarch64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::MachOTlsGetAddr { rd, .. } => {
             collector.reg_fixed_def(rd, regs::xreg(0));
             let mut clobbers =
-                AArch64MachineDeps::get_regs_clobbered_by_call(CallConv::AppleAarch64);
+                AArch64MachineDeps::get_regs_clobbered_by_call(CallConv::AppleAarch64, false);
             clobbers.remove(regs::xreg_preg(0));
             collector.reg_clobbers(clobbers);
         }
@@ -971,10 +950,18 @@ impl MachInst for Inst {
     }
 
     fn is_included_in_clobbers(&self) -> bool {
-        let (caller, callee) = match self {
+        let (caller, callee, is_exception) = match self {
             Inst::Args { .. } => return false,
-            Inst::Call { info } => (info.caller_conv, info.callee_conv),
-            Inst::CallInd { info } => (info.caller_conv, info.callee_conv),
+            Inst::Call { info } => (
+                info.caller_conv,
+                info.callee_conv,
+                info.try_call_info.is_some(),
+            ),
+            Inst::CallInd { info } => (
+                info.caller_conv,
+                info.callee_conv,
+                info.try_call_info.is_some(),
+            ),
             _ => return true,
         };
 
@@ -989,8 +976,8 @@ impl MachInst for Inst {
         //
         // See the note in [crate::isa::aarch64::abi::is_caller_save_reg] for
         // more information on this ABI-implementation hack.
-        let caller_clobbers = AArch64MachineDeps::get_regs_clobbered_by_call(caller);
-        let callee_clobbers = AArch64MachineDeps::get_regs_clobbered_by_call(callee);
+        let caller_clobbers = AArch64MachineDeps::get_regs_clobbered_by_call(caller, is_exception);
+        let callee_clobbers = AArch64MachineDeps::get_regs_clobbered_by_call(callee, is_exception);
 
         let mut all_clobbers = caller_clobbers;
         all_clobbers.union_from(callee_clobbers);
@@ -1015,11 +1002,13 @@ impl MachInst for Inst {
         match self {
             &Inst::Rets { .. } => MachTerminator::Ret,
             &Inst::ReturnCall { .. } | &Inst::ReturnCallInd { .. } => MachTerminator::RetCall,
-            &Inst::Jump { .. } => MachTerminator::Uncond,
-            &Inst::CondBr { .. } => MachTerminator::Cond,
-            &Inst::TestBitAndBranch { .. } => MachTerminator::Cond,
-            &Inst::IndirectBr { .. } => MachTerminator::Indirect,
-            &Inst::JTSequence { .. } => MachTerminator::Indirect,
+            &Inst::Jump { .. } => MachTerminator::Branch,
+            &Inst::CondBr { .. } => MachTerminator::Branch,
+            &Inst::TestBitAndBranch { .. } => MachTerminator::Branch,
+            &Inst::IndirectBr { .. } => MachTerminator::Branch,
+            &Inst::JTSequence { .. } => MachTerminator::Branch,
+            &Inst::Call { ref info } if info.try_call_info.is_some() => MachTerminator::Branch,
+            &Inst::CallInd { ref info } if info.try_call_info.is_some() => MachTerminator::Branch,
             _ => MachTerminator::None,
         }
     }
@@ -1113,9 +1102,12 @@ impl MachInst for Inst {
             F64 => Ok((&[RegClass::Float], &[F64])),
             F128 => Ok((&[RegClass::Float], &[F128])),
             I128 => Ok((&[RegClass::Int, RegClass::Int], &[I64, I64])),
-            _ if ty.is_vector() => {
-                assert!(ty.bits() <= 128);
-                Ok((&[RegClass::Float], &[I8X16]))
+            _ if ty.is_vector() && ty.bits() <= 128 => {
+                let types = &[types::I8X2, types::I8X4, types::I8X8, types::I8X16];
+                Ok((
+                    &[RegClass::Float],
+                    slice::from_ref(&types[ty.bytes().ilog2() as usize - 1]),
+                ))
             }
             _ if ty.is_dynamic_vector() => Ok((&[RegClass::Float], &[I8X16])),
             _ => Err(CodegenError::Unsupported(format!(
@@ -1192,6 +1184,16 @@ fn mem_finalize_for_show(mem: &AMode, access_ty: Type, state: &EmitState) -> (St
 
     let mem = mem.pretty_print(access_ty.bytes() as u8);
     (mem_str, mem)
+}
+
+fn pretty_print_try_call(info: &TryCallInfo) -> String {
+    let dests = info
+        .exception_dests
+        .iter()
+        .map(|(tag, label)| format!("{tag:?}: {label:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; b {:?}; catch [{dests}]", info.continuation)
 }
 
 impl Inst {
@@ -2559,10 +2561,22 @@ impl Inst {
                     format!("{op} {rd}, {rn}")
                 }
             }
-            &Inst::Call { .. } => format!("bl 0"),
+            &Inst::Call { ref info } => {
+                let try_call = info
+                    .try_call_info
+                    .as_ref()
+                    .map(|tci| pretty_print_try_call(tci))
+                    .unwrap_or_default();
+                format!("bl 0{try_call}")
+            }
             &Inst::CallInd { ref info } => {
                 let rn = pretty_print_reg(info.dest);
-                format!("blr {rn}")
+                let try_call = info
+                    .try_call_info
+                    .as_ref()
+                    .map(|tci| pretty_print_try_call(tci))
+                    .unwrap_or_default();
+                format!("blr {rn}{try_call}")
             }
             &Inst::ReturnCall { ref info } => {
                 let mut s = format!(
@@ -2666,7 +2680,7 @@ impl Inst {
                 let rn = pretty_print_reg(rn);
                 format!("br {rn}")
             }
-            &Inst::Brk => "brk #0".to_string(),
+            &Inst::Brk => "brk #0xf000".to_string(),
             &Inst::Udf { .. } => "udf #0xc11f".to_string(),
             &Inst::TrapIf {
                 ref kind,

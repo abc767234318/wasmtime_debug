@@ -134,7 +134,6 @@ pub(super) fn run(
         inliner.record_export(name, def, types, &mut export_map)?;
     }
     inliner.result.exports = export_map;
-    inliner.result.num_resource_tables = types.num_resource_tables();
     inliner.result.num_future_tables = types.num_future_tables();
     inliner.result.num_stream_tables = types.num_stream_tables();
     inliner.result.num_error_context_tables = types.num_error_context_tables();
@@ -793,17 +792,12 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
-                let err_ctx_ty = types.error_context_table_type()?;
                 let options = self.adapter_options(frame, types, options);
                 let options = self.canonical_options(options);
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::StreamRead {
-                        ty,
-                        err_ctx_ty,
-                        options,
-                    },
-                ));
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamRead { ty, options }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             StreamWrite { ty, func, options } => {
@@ -868,11 +862,10 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
-                let err_ctx_ty = types.error_context_table_type()?;
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::StreamCloseWritable { ty, err_ctx_ty },
-                ));
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::StreamCloseWritable { ty }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             FutureNew { ty, func } => {
@@ -893,17 +886,12 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
-                let err_ctx_ty = types.error_context_table_type()?;
                 let options = self.adapter_options(frame, types, options);
                 let options = self.canonical_options(options);
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::FutureRead {
-                        ty,
-                        err_ctx_ty,
-                        options,
-                    },
-                ));
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureRead { ty, options }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             FutureWrite { ty, func, options } => {
@@ -968,11 +956,10 @@ impl<'a> Inliner<'a> {
                 else {
                     unreachable!()
                 };
-                let err_ctx_ty = types.error_context_table_type()?;
-                let index = self.result.trampolines.push((
-                    *func,
-                    dfg::Trampoline::FutureCloseWritable { ty, err_ctx_ty },
-                ));
+                let index = self
+                    .result
+                    .trampolines
+                    .push((*func, dfg::Trampoline::FutureCloseWritable { ty }));
                 frame.funcs.push(dfg::CoreDef::Trampoline(index));
             }
             ErrorContextNew { func, options } => {
@@ -1417,7 +1404,9 @@ impl<'a> Inliner<'a> {
                 // somewhat tricky and needs something like temporary scratch
                 // space that isn't implemented.
                 ComponentFuncDef::Import(_) => {
-                    bail!("component export `{name}` is a reexport of an imported function which is not implemented")
+                    bail!(
+                        "component export `{name}` is a reexport of an imported function which is not implemented"
+                    )
                 }
             },
 

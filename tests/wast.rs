@@ -1,10 +1,10 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use libtest_mimic::{Arguments, FormatSetting, Trial};
 use std::sync::{Condvar, LazyLock, Mutex};
 use wasmtime::{
     Config, Engine, InstanceAllocationStrategy, MpkEnabled, PoolingAllocationConfig, Store,
 };
-use wasmtime_test_util::wast::{limits, Collector, Compiler, WastConfig, WastTest};
+use wasmtime_test_util::wast::{Collector, Compiler, WastConfig, WastTest, limits};
 use wasmtime_wast::{Async, SpectestConfig, WastContext};
 
 fn main() {
@@ -18,57 +18,81 @@ fn main() {
 
     let mut trials = Vec::new();
 
-    // For each test generate a combinatorial matrix of all configurations to
-    // run this test in.
-    for test in tests {
-        let test_uses_gc_types = test.test_uses_gc_types();
-        for compiler in [
-            Compiler::CraneliftNative,
-            Compiler::Winch,
-            Compiler::CraneliftPulley,
-        ] {
-            // Skip compilers that have no support for this host.
-            if !compiler.supports_host() {
-                continue;
-            }
-
-            for pooling in [true, false] {
-                let collectors: &[_] = if !pooling && test_uses_gc_types {
-                    &[Collector::DeferredReferenceCounting, Collector::Null]
+    let mut add_trial = |test: &WastTest, config: WastConfig| {
+        let trial = Trial::test(
+            format!(
+                "{:?}/{}{}{}",
+                config.compiler,
+                if config.pooling { "pooling/" } else { "" },
+                if config.collector != Collector::Auto {
+                    format!("{:?}/", config.collector)
                 } else {
-                    &[Collector::Auto]
-                };
+                    String::new()
+                },
+                test.path.to_str().unwrap()
+            ),
+            {
+                let test = test.clone();
+                move || run_wast(&test, config).map_err(|e| format!("{e:?}").into())
+            },
+        );
 
-                for collector in collectors.iter().copied() {
-                    let trial = Trial::test(
-                        format!(
-                            "{compiler:?}/{}{}{}",
-                            if pooling { "pooling/" } else { "" },
-                            if collector != Collector::Auto {
-                                format!("{collector:?}/")
-                            } else {
-                                String::new()
-                            },
-                            test.path.to_str().unwrap()
-                        ),
-                        {
-                            let test = test.clone();
-                            move || {
-                                run_wast(
-                                    &test,
-                                    WastConfig {
-                                        compiler,
-                                        pooling,
-                                        collector,
-                                    },
-                                )
-                                .map_err(|e| format!("{e:?}").into())
-                            }
-                        },
-                    );
-                    trials.push(trial);
-                }
-            }
+        trials.push(trial);
+    };
+
+    // List of supported compilers, filtered by what our current host supports.
+    let mut compilers = vec![
+        Compiler::CraneliftNative,
+        Compiler::Winch,
+        Compiler::CraneliftPulley,
+    ];
+    compilers.retain(|c| c.supports_host());
+
+    // Run each wast test in a few interesting configuration combinations, but
+    // leave the full combinatorial matrix and such to fuzz testing which
+    // configures many more settings than those configured here.
+    for test in tests {
+        let collector = if test.test_uses_gc_types() {
+            Collector::DeferredReferenceCounting
+        } else {
+            Collector::Auto
+        };
+
+        // Run this test in all supported compilers.
+        for compiler in compilers.iter().copied() {
+            add_trial(
+                &test,
+                WastConfig {
+                    compiler,
+                    pooling: false,
+                    collector,
+                },
+            );
+        }
+
+        let compiler = compilers[0];
+
+        // Run this test with the pooling allocator under the default compiler.
+        add_trial(
+            &test,
+            WastConfig {
+                compiler,
+                pooling: true,
+                collector,
+            },
+        );
+
+        // If applicable, also run with the null collector in addition to the
+        // default collector.
+        if test.test_uses_gc_types() {
+            add_trial(
+                &test,
+                WastConfig {
+                    compiler,
+                    pooling: false,
+                    collector: Collector::Null,
+                },
+            );
         }
     }
 
@@ -85,23 +109,10 @@ fn main() {
 // function which actually executes the `wast` test suite given the `strategy`
 // to compile it.
 fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
-    let mut test_config = test.config.clone();
+    let test_config = test.config.clone();
 
-    // FIXME: this is a bit of a hack to get Winch working here for now. Winch
-    // passes some tests on aarch64 so returning `true` from `should_fail`
-    // doesn't work. Winch doesn't pass many tests though as it either panics or
-    // segfaults as AArch64 support isn't finished yet. That means that we can't
-    // have, for example, an allow-list of tests that should pass and assume
-    // everything else fails. In lieu of all of this we feign all tests as
-    // requiring references types which Wasmtime understands that Winch doesn't
-    // support on aarch64 which means that all tests fail quickly in config
-    // validation.
-    //
-    // Ideally the aarch64 backend for Winch would return a normal error on
-    // unsupported opcodes and not segfault, meaning that this would not be
-    // needed.
-    if cfg!(target_arch = "aarch64") && test_config.reference_types.is_none() {
-        test_config.reference_types = Some(true);
+    if test.ignore(&config) {
+        return Ok(());
     }
 
     // Determine whether this test is expected to fail or pass. Regardless the
@@ -231,6 +242,7 @@ fn run_wast(test: &WastTest, config: WastConfig) -> anyhow::Result<()> {
         let result = engine.and_then(|engine| {
             let store = Store::new(&engine, ());
             let mut wast_context = WastContext::new(store, Async::Yes);
+            wast_context.generate_dwarf(true);
             wast_context.register_spectest(&SpectestConfig {
                 use_shared_memory: true,
                 suppress_prints: true,

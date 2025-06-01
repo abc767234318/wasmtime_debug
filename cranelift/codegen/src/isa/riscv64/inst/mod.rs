@@ -3,18 +3,18 @@
 use super::lower::isle::generated_code::{VecAMode, VecElementWidth, VecOpMasking};
 use crate::binemit::{Addend, CodeOffset, Reloc};
 pub use crate::ir::condcodes::IntCC;
-use crate::ir::types::{self, F128, F16, F32, F64, I128, I16, I32, I64, I8, I8X16};
+use crate::ir::types::{self, F16, F32, F64, F128, I8, I8X16, I16, I32, I64, I128};
 
 pub use crate::ir::{ExternalName, MemFlags, Type};
 use crate::isa::{CallConv, FunctionAlignment};
 use crate::machinst::*;
-use crate::{settings, CodegenError, CodegenResult};
+use crate::{CodegenError, CodegenResult, settings};
 
 pub use crate::ir::condcodes::FloatCC;
 
 use alloc::vec::Vec;
 use regalloc2::RegClass;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::boxed::Box;
 use std::fmt::Write;
 use std::string::{String, ToString};
@@ -46,8 +46,8 @@ pub(crate) type VecU8 = Vec<u8>;
 // Instructions (top level): definition
 
 pub use crate::isa::riscv64::lower::isle::generated_code::{
-    AluOPRRI, AluOPRRR, AtomicOP, CsrImmOP, CsrRegOP, FClassResult, FFlagsException, FpuOPRR,
-    FpuOPRRR, FpuOPRRRR, LoadOP, MInst as Inst, StoreOP, CSR, FRM,
+    AluOPRRI, AluOPRRR, AtomicOP, CSR, CsrImmOP, CsrRegOP, FClassResult, FFlagsException, FRM,
+    FpuOPRR, FpuOPRRR, FpuOPRRRR, LoadOP, MInst as Inst, StoreOP,
 };
 use crate::isa::riscv64::lower::isle::generated_code::{CjOp, MInst, VecAluOpRRImm5, VecAluOpRRR};
 
@@ -335,8 +335,11 @@ fn riscv64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
             }
-            for CallRetPair { vreg, preg } in defs {
-                collector.reg_fixed_def(vreg, *preg);
+            for CallRetPair { vreg, location } in defs {
+                match location {
+                    RetLocation::Reg(preg, ..) => collector.reg_fixed_def(vreg, *preg),
+                    RetLocation::Stack(..) => collector.any_def(vreg),
+                }
             }
             collector.reg_clobbers(info.clobbers);
         }
@@ -348,8 +351,11 @@ fn riscv64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             for CallArgPair { vreg, preg } in uses {
                 collector.reg_fixed_use(vreg, *preg);
             }
-            for CallRetPair { vreg, preg } in defs {
-                collector.reg_fixed_def(vreg, *preg);
+            for CallRetPair { vreg, location } in defs {
+                match location {
+                    RetLocation::Reg(preg, ..) => collector.reg_fixed_def(vreg, *preg),
+                    RetLocation::Stack(..) => collector.any_def(vreg),
+                }
             }
             collector.reg_clobbers(info.clobbers);
         }
@@ -384,7 +390,8 @@ fn riscv64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
         Inst::ElfTlsGetAddr { rd, .. } => {
             // x10 is a0 which is both the first argument and the first return value.
             collector.reg_fixed_def(rd, a0());
-            let mut clobbers = Riscv64MachineDeps::get_regs_clobbered_by_call(CallConv::SystemV);
+            let mut clobbers =
+                Riscv64MachineDeps::get_regs_clobbered_by_call(CallConv::SystemV, false);
             clobbers.remove(px_reg(10));
             collector.reg_clobbers(clobbers);
         }
@@ -680,6 +687,7 @@ fn riscv64_get_operands(inst: &mut Inst, collector: &mut impl OperandVisitor) {
             collector.reg_use(from);
             vec_mask_operands(mask, collector);
         }
+        Inst::EmitIsland { .. } => {}
     }
 }
 
@@ -744,12 +752,14 @@ impl MachInst for Inst {
 
     fn is_term(&self) -> MachTerminator {
         match self {
-            &Inst::Jal { .. } => MachTerminator::Uncond,
-            &Inst::CondBr { .. } => MachTerminator::Cond,
-            &Inst::Jalr { .. } => MachTerminator::Uncond,
+            &Inst::Jal { .. } => MachTerminator::Branch,
+            &Inst::CondBr { .. } => MachTerminator::Branch,
+            &Inst::Jalr { .. } => MachTerminator::Branch,
             &Inst::Rets { .. } => MachTerminator::Ret,
-            &Inst::BrTable { .. } => MachTerminator::Indirect,
+            &Inst::BrTable { .. } => MachTerminator::Branch,
             &Inst::ReturnCall { .. } | &Inst::ReturnCallInd { .. } => MachTerminator::RetCall,
+            &Inst::Call { ref info } if info.try_call_info.is_some() => MachTerminator::Branch,
+            &Inst::CallInd { ref info } if info.try_call_info.is_some() => MachTerminator::Branch,
             _ => MachTerminator::None,
         }
     }
@@ -785,7 +795,8 @@ impl MachInst for Inst {
             F16 => Ok((&[RegClass::Float], &[F16])),
             F32 => Ok((&[RegClass::Float], &[F32])),
             F64 => Ok((&[RegClass::Float], &[F64])),
-            I128 => Ok((&[RegClass::Int, RegClass::Int], &[I64, I64])),
+            // FIXME(#8312): Add support for Q extension
+            F128 | I128 => Ok((&[RegClass::Int, RegClass::Int], &[I64, I64])),
             _ if ty.is_vector() => {
                 debug_assert!(ty.bits() <= 512);
 
@@ -865,6 +876,16 @@ pub fn reg_name(reg: Reg) -> String {
             format!("{reg:?}")
         }
     }
+}
+
+fn pretty_print_try_call(info: &TryCallInfo) -> String {
+    let dests = info
+        .exception_dests
+        .iter()
+        .map(|(tag, label)| format!("{tag:?}: {label:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; j {:?}; catch [{dests}]", info.continuation)
 }
 
 impl Inst {
@@ -1088,16 +1109,10 @@ impl Inst {
             &Inst::Lui { rd, ref imm } => {
                 format!("{} {},{}", "lui", format_reg(rd.to_reg()), imm.as_i32())
             }
-            &Inst::Fli { rd, ty, imm } => {
+            &Inst::Fli { rd, width, imm } => {
                 let rd_s = format_reg(rd.to_reg());
                 let imm_s = imm.format();
-                let suffix = match ty {
-                    F32 => "s",
-                    F64 => "d",
-                    _ => unreachable!(),
-                };
-
-                format!("fli.{suffix} {rd_s},{imm_s}")
+                format!("fli.{width} {rd_s},{imm_s}")
             }
             &Inst::LoadInlineConst { rd, imm, .. } => {
                 let rd = format_reg(rd.to_reg());
@@ -1298,10 +1313,22 @@ impl Inst {
                     format!("slli {rd},{rn},{shift_bits}; {op} {rd},{rd},{shift_bits}")
                 };
             }
-            &MInst::Call { ref info } => format!("call {}", info.dest.display(None)),
+            &MInst::Call { ref info } => {
+                let try_call = info
+                    .try_call_info
+                    .as_ref()
+                    .map(|tci| pretty_print_try_call(tci))
+                    .unwrap_or_default();
+                format!("call {}{try_call}", info.dest.display(None))
+            }
             &MInst::CallInd { ref info } => {
                 let rd = format_reg(info.dest);
-                format!("callind {rd}")
+                let try_call = info
+                    .try_call_info
+                    .as_ref()
+                    .map(|tci| pretty_print_try_call(tci))
+                    .unwrap_or_default();
+                format!("callind {rd}{try_call}")
             }
             &MInst::ReturnCall { ref info } => {
                 let mut s = format!(
@@ -1611,6 +1638,9 @@ impl Inst {
                 let mask = format_mask(mask);
 
                 format!("vs{eew}.v {vs3},{dst}{mask} {vstate}")
+            }
+            Inst::EmitIsland { needed_space } => {
+                format!("emit_island {needed_space}")
             }
         }
     }

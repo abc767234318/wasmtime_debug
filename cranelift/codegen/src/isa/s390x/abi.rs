@@ -132,21 +132,21 @@
 //!   (low address)
 //! ```
 
+use crate::CodegenResult;
 use crate::ir;
-use crate::ir::condcodes::IntCC;
-use crate::ir::types;
 use crate::ir::MemFlags;
 use crate::ir::Signature;
 use crate::ir::Type;
+use crate::ir::condcodes::IntCC;
+use crate::ir::types;
 use crate::isa;
 use crate::isa::s390x::{inst::*, settings as s390x_settings};
 use crate::isa::unwind::UnwindInst;
 use crate::machinst::*;
 use crate::settings;
-use crate::CodegenResult;
 use alloc::vec::Vec;
 use regalloc2::{MachineEnv, PRegSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::borrow::ToOwned;
 use std::sync::OnceLock;
 
@@ -166,7 +166,7 @@ fn in_int_reg(ty: Type) -> bool {
 
 fn in_flt_reg(ty: Type) -> bool {
     match ty {
-        types::F32 | types::F64 => true,
+        types::F16 | types::F32 | types::F64 => true,
         _ => false,
     }
 }
@@ -253,13 +253,24 @@ fn get_vecreg_for_ret(idx: usize) -> Option<Reg> {
 /// The size of the register save area
 pub static REG_SAVE_AREA_SIZE: u32 = 160;
 
-impl Into<MemArg> for StackAMode {
-    fn into(self) -> MemArg {
-        match self {
-            // Argument area always begins at the initial SP.
-            StackAMode::IncomingArg(off, _) => MemArg::InitialSPOffset { off },
+impl From<StackAMode> for MemArg {
+    fn from(stack: StackAMode) -> MemArg {
+        match stack {
+            StackAMode::IncomingArg(off, stack_args_size) => MemArg::IncomingArgOffset {
+                off: off - stack_args_size as i64,
+            },
             StackAMode::Slot(off) => MemArg::SlotOffset { off },
-            StackAMode::OutgoingArg(off) => MemArg::NominalSPOffset { off },
+            StackAMode::OutgoingArg(off) => MemArg::OutgoingArgOffset { off },
+        }
+    }
+}
+
+/// Lane order to be used for a given calling convention.
+impl From<isa::CallConv> for LaneOrder {
+    fn from(call_conv: isa::CallConv) -> Self {
+        match call_conv {
+            isa::CallConv::Tail => LaneOrder::LittleEndian,
+            _ => LaneOrder::BigEndian,
         }
     }
 }
@@ -307,14 +318,6 @@ impl ABIMachineSpec for S390xMachineDeps {
         let mut next_fpr = 0;
         let mut next_vr = 0;
         let mut next_stack: u32 = 0;
-
-        // The bottom of the stack frame holds the register save area.  To simplify
-        // offset computation, include this area as part of the argument area;
-        // however, this does not apply to the tail-call convention, which uses the
-        // callee frame instead to pass arguments.
-        if call_conv != isa::CallConv::Tail && args_or_rets == ArgsOrRets::Args {
-            next_stack = REG_SAVE_AREA_SIZE;
-        }
 
         let ret_area_ptr = if add_ret_area_ptr {
             debug_assert_eq!(args_or_rets, ArgsOrRets::Args);
@@ -461,30 +464,12 @@ impl ABIMachineSpec for S390xMachineDeps {
         }
 
         // With the tail-call convention, arguments are passed in the *callee*'s
-        // frame instead of the caller's frame.  Update all offsets accordingly
-        // (note that resulting offsets will all be negative).
+        // frame instead of the caller's frame.  This means that the register save
+        // area will lie between the incoming arguments and the return buffer.
+        // Include the size of the register area in the argument area size to
+        // match common code expectation that the return buffer resides immediately
+        // above the argument area.
         if call_conv == isa::CallConv::Tail && args_or_rets == ArgsOrRets::Args && next_stack != 0 {
-            for arg in args.args_mut() {
-                match arg {
-                    ABIArg::Slots { slots, .. } => {
-                        for slot in slots {
-                            match slot {
-                                ABIArgSlot::Reg { .. } => {}
-                                ABIArgSlot::Stack { offset, .. } => {
-                                    *offset -= next_stack as i64;
-                                }
-                            }
-                        }
-                    }
-                    ABIArg::StructArg { .. } => unreachable!(),
-                    ABIArg::ImplicitPtrArg { offset, .. } => {
-                        *offset -= next_stack as i64;
-                    }
-                }
-            }
-            // If we have any stack arguments, also allow for a temporary copy
-            // of the register save area.  This is only used until the callee
-            // has finished setting up its own frame.
             next_stack += REG_SAVE_AREA_SIZE;
         }
 
@@ -852,10 +837,6 @@ impl ABIMachineSpec for S390xMachineDeps {
         insts
     }
 
-    fn gen_call(_dest: &CallDest, _tmp: Writable<Reg>, _info: CallInfo<()>) -> SmallVec<[Inst; 2]> {
-        unreachable!();
-    }
-
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
         _call_conv: isa::CallConv,
         _dst: Reg,
@@ -892,8 +873,12 @@ impl ABIMachineSpec for S390xMachineDeps {
         }
     }
 
-    fn get_regs_clobbered_by_call(call_conv_of_callee: isa::CallConv) -> PRegSet {
+    fn get_regs_clobbered_by_call(
+        call_conv_of_callee: isa::CallConv,
+        is_exception: bool,
+    ) -> PRegSet {
         match call_conv_of_callee {
+            isa::CallConv::Tail if is_exception => ALL_CLOBBERS,
             isa::CallConv::Tail => TAIL_CLOBBERS,
             _ => SYSV_CLOBBERS,
         }
@@ -914,6 +899,7 @@ impl ABIMachineSpec for S390xMachineDeps {
         _is_leaf: bool,
         incoming_args_size: u32,
         tail_args_size: u32,
+        stackslots_size: u32,
         fixed_frame_storage_size: u32,
         mut outgoing_args_size: u32,
     ) -> FrameLayout {
@@ -985,8 +971,21 @@ impl ABIMachineSpec for S390xMachineDeps {
             setup_area_size: 0,
             clobber_size,
             fixed_frame_storage_size,
+            stackslots_size,
             outgoing_args_size,
             clobbered_callee_saves: regs,
+        }
+    }
+
+    fn retval_temp_reg(_call_conv_of_callee: isa::CallConv) -> Writable<Reg> {
+        panic!("Should not be called");
+    }
+
+    fn exception_payload_regs(call_conv: isa::CallConv) -> &'static [Reg] {
+        const PAYLOAD_REGS: &'static [Reg] = &[gpr(6), gpr(7)];
+        match call_conv {
+            isa::CallConv::SystemV | isa::CallConv::Tail => PAYLOAD_REGS,
+            _ => &[],
         }
     }
 }
@@ -995,8 +994,8 @@ impl S390xMachineDeps {
     pub fn gen_tail_epilogue(
         frame_layout: &FrameLayout,
         callee_pop_size: u32,
-        target_reg: Option<&mut Reg>,
-    ) -> SmallVec<[Inst; 16]> {
+        dest: &CallInstDest,
+    ) -> (SmallVec<[Inst; 16]>, Option<Reg>) {
         let mut insts = SmallVec::new();
         let call_conv = isa::CallConv::Tail;
 
@@ -1006,19 +1005,92 @@ impl S390xMachineDeps {
         // If the tail call target is in a callee-saved GPR, we need to move it
         // to %r1 (as the only available temp register) before restoring GPRs
         // (but after restoring FPRs, which might clobber %r1).
-        if let Some(reg) = target_reg {
-            if is_reg_saved_in_prologue(call_conv, reg.to_real_reg().unwrap()) {
+        let temp_dest = match dest {
+            CallInstDest::Indirect { reg }
+                if reg.to_real_reg().is_some()
+                    && is_reg_saved_in_prologue(call_conv, reg.to_real_reg().unwrap()) =>
+            {
                 insts.push(Inst::Mov64 {
                     rd: writable_gpr(1),
                     rm: *reg,
                 });
-                *reg = gpr(1);
+                Some(gpr(1))
             }
-        }
+            _ => None,
+        };
 
         // Restore GPRs (including SP).
         insts.extend(gen_restore_gprs(call_conv, frame_layout, callee_pop_size));
 
+        (insts, temp_dest)
+    }
+
+    /// Emit loads for any stack-carried return values using the call
+    /// info and allocations.  In addition, emit lane swaps for all
+    /// vector-types return values if needed.
+    pub fn gen_retval_loads(info: &CallInfo<CallInstDest>) -> SmallInstVec<Inst> {
+        let mut insts = SmallVec::new();
+
+        // Helper routine to lane-swap a register if needed.
+        let lane_swap_if_needed = |insts: &mut SmallInstVec<Inst>, vreg, ty: Type| {
+            if LaneOrder::from(info.caller_conv) != LaneOrder::from(info.callee_conv) {
+                if ty.is_vector() && ty.lane_count() >= 2 {
+                    insts.push(Inst::VecEltRev {
+                        lane_count: ty.lane_count(),
+                        rd: vreg,
+                        rn: vreg.to_reg(),
+                    });
+                }
+            }
+        };
+
+        // Helper routine to allocate a temp register for ty.
+        let temp_reg = |ty| match Inst::rc_for_type(ty).unwrap() {
+            (&[RegClass::Int], _) => writable_gpr(0),
+            (&[RegClass::Float], _) => writable_vr(1),
+            _ => unreachable!(),
+        };
+
+        // Do a first pass over the return locations to handle copies that
+        // need temp registers.  These need to be done before regular stack
+        // loads in case the destination of a load happens to be our temp
+        // register.  (The temp registers by choice are distinct from all
+        // real return registers, which we verify here again.)
+        for CallRetPair { vreg, location } in &info.defs {
+            match location {
+                RetLocation::Reg(preg, ty) => {
+                    debug_assert!(*preg != temp_reg(*ty).to_reg());
+                }
+                RetLocation::Stack(amode, ty) => {
+                    if let Some(spillslot) = vreg.to_reg().to_spillslot() {
+                        let temp = temp_reg(*ty);
+                        insts.push(Inst::gen_load(temp, (*amode).into(), *ty));
+                        lane_swap_if_needed(&mut insts, temp, *ty);
+                        insts.push(Inst::gen_store(
+                            MemArg::SpillOffset {
+                                off: 8 * (spillslot.index() as i64),
+                            },
+                            temp.to_reg(),
+                            Inst::canonical_type_for_rc(temp.to_reg().class()),
+                        ));
+                    }
+                }
+            }
+        }
+        // Now handle all remaining return locations.
+        for CallRetPair { vreg, location } in &info.defs {
+            match location {
+                RetLocation::Reg(preg, ty) => {
+                    lane_swap_if_needed(&mut insts, Writable::from_reg(*preg), *ty);
+                }
+                RetLocation::Stack(amode, ty) => {
+                    if vreg.to_reg().to_spillslot().is_none() {
+                        insts.push(Inst::gen_load(*vreg, (*amode).into(), *ty));
+                        lane_swap_if_needed(&mut insts, *vreg, *ty);
+                    }
+                }
+            }
+        }
         insts
     }
 }
@@ -1254,6 +1326,59 @@ const fn tail_clobbers() -> PRegSet {
         .with(vr_preg(31))
 }
 const TAIL_CLOBBERS: PRegSet = tail_clobbers();
+
+const fn all_clobbers() -> PRegSet {
+    PRegSet::empty()
+        .with(gpr_preg(0))
+        .with(gpr_preg(1))
+        .with(gpr_preg(2))
+        .with(gpr_preg(3))
+        .with(gpr_preg(4))
+        .with(gpr_preg(5))
+        .with(gpr_preg(6))
+        .with(gpr_preg(7))
+        .with(gpr_preg(8))
+        .with(gpr_preg(9))
+        .with(gpr_preg(10))
+        .with(gpr_preg(11))
+        .with(gpr_preg(12))
+        .with(gpr_preg(13))
+        .with(gpr_preg(14))
+        .with(gpr_preg(15))
+        .with(vr_preg(0))
+        .with(vr_preg(1))
+        .with(vr_preg(2))
+        .with(vr_preg(3))
+        .with(vr_preg(4))
+        .with(vr_preg(5))
+        .with(vr_preg(6))
+        .with(vr_preg(7))
+        .with(vr_preg(8))
+        .with(vr_preg(9))
+        .with(vr_preg(10))
+        .with(vr_preg(11))
+        .with(vr_preg(12))
+        .with(vr_preg(13))
+        .with(vr_preg(14))
+        .with(vr_preg(15))
+        .with(vr_preg(16))
+        .with(vr_preg(17))
+        .with(vr_preg(18))
+        .with(vr_preg(19))
+        .with(vr_preg(20))
+        .with(vr_preg(21))
+        .with(vr_preg(22))
+        .with(vr_preg(23))
+        .with(vr_preg(24))
+        .with(vr_preg(25))
+        .with(vr_preg(26))
+        .with(vr_preg(27))
+        .with(vr_preg(28))
+        .with(vr_preg(29))
+        .with(vr_preg(30))
+        .with(vr_preg(31))
+}
+const ALL_CLOBBERS: PRegSet = all_clobbers();
 
 fn sysv_create_machine_env() -> MachineEnv {
     MachineEnv {

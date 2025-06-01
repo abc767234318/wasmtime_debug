@@ -76,23 +76,25 @@
 //! contents of `StoreOpaque`. This is an invariant that we, as the authors of
 //! `wasmtime`, must uphold for the public interface to be safe.
 
+use crate::RootSet;
 use crate::instance::InstanceData;
 use crate::linker::Definition;
 use crate::module::RegisteredModuleId;
 use crate::prelude::*;
-use crate::runtime::vm::mpk::ProtectionKey;
 #[cfg(feature = "gc")]
 use crate::runtime::vm::GcRootsList;
+use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::{
-    ExportGlobal, GcStore, InstanceAllocationRequest, InstanceAllocator, InstanceHandle,
-    Interpreter, InterpreterRef, ModuleRuntimeInfo, OnDemandInstanceAllocator, SignalHandler,
-    StoreBox, StorePtr, Unwind, VMContext, VMFuncRef, VMGcRef, VMStoreContext,
+    self, ExportGlobal, GcStore, Imports, InstanceAllocationRequest, InstanceAllocator,
+    InstanceHandle, Interpreter, InterpreterRef, ModuleRuntimeInfo, OnDemandInstanceAllocator,
+    SendSyncPtr, SignalHandler, StoreBox, StorePtr, Unwind, VMContext, VMFuncRef, VMGcRef,
+    VMStoreContext,
 };
 use crate::trampoline::VMHostGlobalContext;
-use crate::RootSet;
-use crate::{module::ModuleRegistry, Engine, Module, Trap, Val, ValRaw};
+use crate::{Engine, Module, Trap, Val, ValRaw, module::ModuleRegistry};
 use crate::{Global, Instance, Memory, Table, Uninhabited};
 use alloc::sync::Arc;
+use core::any::Any;
 use core::fmt;
 use core::marker;
 use core::mem::{self, ManuallyDrop};
@@ -113,6 +115,8 @@ mod async_;
 pub use self::async_::CallHookHandler;
 #[cfg(feature = "async")]
 use self::async_::*;
+#[cfg(feature = "gc")]
+mod gc;
 
 /// A [`Store`] is a collection of WebAssembly instances and host-defined state.
 ///
@@ -176,7 +180,7 @@ use self::async_::*;
 /// operations is incorrect. In other words it's considered a programmer error
 /// rather than a recoverable error for the wrong [`Store`] to be used when
 /// calling APIs.
-pub struct Store<T> {
+pub struct Store<T: 'static> {
     // for comments about `ManuallyDrop`, see `Store::into_data`
     inner: ManuallyDrop<Box<StoreInner<T>>>,
 }
@@ -217,7 +221,7 @@ impl CallHook {
 /// The members of this struct are those that need to be generic over `T`, the
 /// store's internal type storage. Otherwise all things that don't rely on `T`
 /// should go into `StoreOpaque`.
-pub struct StoreInner<T> {
+pub struct StoreInner<T: 'static> {
     /// Generic metadata about the store that doesn't need access to `T`.
     inner: StoreOpaque,
 
@@ -236,7 +240,7 @@ enum ResourceLimiterInner<T> {
     Async(Box<dyn FnMut(&mut T) -> &mut (dyn crate::ResourceLimiterAsync) + Send + Sync>),
 }
 
-enum CallHookInner<T> {
+enum CallHookInner<T: 'static> {
     #[cfg(feature = "call-hook")]
     Sync(Box<dyn FnMut(StoreContextMut<'_, T>, CallHook) -> Result<()> + Send + Sync>),
     #[cfg(all(feature = "async", feature = "call-hook"))]
@@ -250,6 +254,7 @@ enum CallHookInner<T> {
 
 /// What to do after returning from a callback when the engine epoch reaches
 /// the deadline for a Store during execution of a function using that store.
+#[non_exhaustive]
 pub enum UpdateDeadline {
     /// Extend the deadline by the specified number of ticks.
     Continue(u64),
@@ -258,6 +263,18 @@ pub enum UpdateDeadline {
     /// configured via [`Config::async_support`](crate::Config::async_support).
     #[cfg(feature = "async")]
     Yield(u64),
+    /// Extend the deadline by the specified number of ticks after yielding to
+    /// the async executor loop. This can only be used with an async [`Store`]
+    /// configured via [`Config::async_support`](crate::Config::async_support).
+    ///
+    /// The yield will be performed by the future provided; when using `tokio`
+    /// it is recommended to provide [`tokio::task::yield_now`](https://docs.rs/tokio/latest/tokio/task/fn.yield_now.html)
+    /// here.
+    #[cfg(feature = "async")]
+    YieldCustom(
+        u64,
+        ::core::pin::Pin<Box<dyn ::core::future::Future<Output = ()> + Send>>,
+    ),
 }
 
 // Forward methods on `StoreOpaque` to also being on `StoreInner<T>`
@@ -346,7 +363,8 @@ pub struct StoreOpaque {
     /// `rooted_host_funcs` below. This structure contains pointers which are
     /// otherwise kept alive by the `Arc` references in `rooted_host_funcs`.
     store_data: ManuallyDrop<StoreData>,
-    default_caller: InstanceHandle,
+    traitobj: StorePtr,
+    default_caller_vmctx: SendSyncPtr<VMContext>,
 
     /// Used to optimized wasm->host calls when the host function is defined with
     /// `Func::new` to avoid allocating a new vector each time a function is
@@ -379,9 +397,9 @@ pub struct StoreOpaque {
     /// and calls. These also interact with the `ResourceAny` type and its
     /// internal representation.
     #[cfg(feature = "component-model")]
-    component_host_table: crate::runtime::vm::component::ResourceTable,
+    component_host_table: vm::component::ResourceTable,
     #[cfg(feature = "component-model")]
-    component_calls: crate::runtime::vm::component::CallContexts,
+    component_calls: vm::component::CallContexts,
     #[cfg(feature = "component-model")]
     host_resource_data: crate::component::HostResourceData,
 
@@ -517,66 +535,73 @@ impl<T> Store<T> {
     /// tables created to 10,000. This can be overridden with the
     /// [`Store::limiter`] configuration method.
     pub fn new(engine: &Engine, data: T) -> Self {
+        let store_data = StoreData::new();
+        log::trace!("creating new store {:?}", store_data.id());
+
         let pkey = engine.allocator().next_available_pkey();
 
-        let mut inner = Box::new(StoreInner {
-            inner: StoreOpaque {
-                _marker: marker::PhantomPinned,
-                engine: engine.clone(),
-                vm_store_context: Default::default(),
-                instances: Vec::new(),
-                #[cfg(feature = "component-model")]
-                num_component_instances: 0,
-                signal_handler: None,
-                gc_store: None,
-                gc_roots: RootSet::default(),
-                #[cfg(feature = "gc")]
-                gc_roots_list: GcRootsList::default(),
-                #[cfg(feature = "gc")]
-                gc_host_alloc_types: Default::default(),
-                modules: ModuleRegistry::default(),
-                func_refs: FuncRefs::default(),
-                host_globals: Vec::new(),
-                instance_count: 0,
-                instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
-                memory_count: 0,
-                memory_limit: crate::DEFAULT_MEMORY_LIMIT,
-                table_count: 0,
-                table_limit: crate::DEFAULT_TABLE_LIMIT,
-                #[cfg(feature = "async")]
-                async_state: AsyncState::default(),
-                fuel_reserve: 0,
-                fuel_yield_interval: None,
-                store_data: ManuallyDrop::new(StoreData::new()),
-                default_caller: InstanceHandle::null(),
-                hostcall_val_storage: Vec::new(),
-                wasm_val_raw_storage: Vec::new(),
-                rooted_host_funcs: ManuallyDrop::new(Vec::new()),
-                pkey,
-                #[cfg(feature = "component-model")]
-                component_host_table: Default::default(),
-                #[cfg(feature = "component-model")]
-                component_calls: Default::default(),
-                #[cfg(feature = "component-model")]
-                host_resource_data: Default::default(),
-                #[cfg(has_host_compiler_backend)]
-                executor: if cfg!(feature = "pulley") && engine.target().is_pulley() {
-                    Executor::Interpreter(Interpreter::new(engine))
-                } else {
-                    Executor::Native
-                },
-                #[cfg(not(has_host_compiler_backend))]
-                executor: {
-                    debug_assert!(engine.target().is_pulley());
-                    Executor::Interpreter(Interpreter::new(engine))
-                },
+        let inner = StoreOpaque {
+            _marker: marker::PhantomPinned,
+            engine: engine.clone(),
+            vm_store_context: Default::default(),
+            instances: Vec::new(),
+            #[cfg(feature = "component-model")]
+            num_component_instances: 0,
+            signal_handler: None,
+            gc_store: None,
+            gc_roots: RootSet::default(),
+            #[cfg(feature = "gc")]
+            gc_roots_list: GcRootsList::default(),
+            #[cfg(feature = "gc")]
+            gc_host_alloc_types: Default::default(),
+            modules: ModuleRegistry::default(),
+            func_refs: FuncRefs::default(),
+            host_globals: Vec::new(),
+            instance_count: 0,
+            instance_limit: crate::DEFAULT_INSTANCE_LIMIT,
+            memory_count: 0,
+            memory_limit: crate::DEFAULT_MEMORY_LIMIT,
+            table_count: 0,
+            table_limit: crate::DEFAULT_TABLE_LIMIT,
+            #[cfg(feature = "async")]
+            async_state: AsyncState::default(),
+            fuel_reserve: 0,
+            fuel_yield_interval: None,
+            store_data: ManuallyDrop::new(store_data),
+            traitobj: StorePtr::empty(),
+            default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
+            hostcall_val_storage: Vec::new(),
+            wasm_val_raw_storage: Vec::new(),
+            rooted_host_funcs: ManuallyDrop::new(Vec::new()),
+            pkey,
+            #[cfg(feature = "component-model")]
+            component_host_table: Default::default(),
+            #[cfg(feature = "component-model")]
+            component_calls: Default::default(),
+            #[cfg(feature = "component-model")]
+            host_resource_data: Default::default(),
+            #[cfg(has_host_compiler_backend)]
+            executor: if cfg!(feature = "pulley") && engine.target().is_pulley() {
+                Executor::Interpreter(Interpreter::new(engine))
+            } else {
+                Executor::Native
             },
+            #[cfg(not(has_host_compiler_backend))]
+            executor: {
+                debug_assert!(engine.target().is_pulley());
+                Executor::Interpreter(Interpreter::new(engine))
+            },
+        };
+        let mut inner = Box::new(StoreInner {
+            inner,
             limiter: None,
             call_hook: None,
             #[cfg(target_has_atomic = "64")]
             epoch_deadline_behavior: None,
             data: ManuallyDrop::new(data),
         });
+
+        inner.traitobj = StorePtr::new(NonNull::from(&mut *inner));
 
         // Wasmtime uses the callee argument to host functions to learn about
         // the original pointer to the `Store` itself, allowing it to
@@ -585,40 +610,28 @@ impl<T> Store<T> {
         // single "default callee" for the entire `Store`. This is then used as
         // part of `Func::call` to guarantee that the `callee: *mut VMContext`
         // is never null.
-        inner.default_caller = {
-            let module = Arc::new(wasmtime_environ::Module::default());
-            let shim = ModuleRuntimeInfo::bare(module);
-            let allocator = OnDemandInstanceAllocator::default();
-            allocator
-                .validate_module(shim.env_module(), shim.offsets())
-                .unwrap();
-            let mut instance = unsafe {
-                allocator
-                    .allocate_module(InstanceAllocationRequest {
-                        host_state: Box::new(()),
-                        imports: Default::default(),
-                        store: StorePtr::empty(),
-                        runtime_info: &shim,
-                        wmemcheck: engine.config().wmemcheck,
-                        pkey: None,
-                        tunables: engine.tunables(),
-                    })
-                    .expect("failed to allocate default callee")
-            };
+        let module = Arc::new(wasmtime_environ::Module::default());
+        let shim = ModuleRuntimeInfo::bare(module);
+        let allocator = OnDemandInstanceAllocator::default();
 
-            // Note the erasure of the lifetime here into `'static`, so in
-            // general usage of this trait object must be strictly bounded to
-            // the `Store` itself, and this is an invariant that we have to
-            // maintain throughout Wasmtime.
-            unsafe {
-                let traitobj = mem::transmute::<
-                    NonNull<dyn crate::runtime::vm::VMStore + '_>,
-                    NonNull<dyn crate::runtime::vm::VMStore + 'static>,
-                >(NonNull::from(&mut *inner));
-                instance.set_store(traitobj);
-                instance
-            }
-        };
+        allocator
+            .validate_module(shim.env_module(), shim.offsets())
+            .unwrap();
+
+        unsafe {
+            let id = inner
+                .allocate_instance(
+                    AllocateInstanceKind::Dummy {
+                        allocator: &allocator,
+                    },
+                    &shim,
+                    Default::default(),
+                    Box::new(()),
+                )
+                .expect("failed to allocate default callee");
+            let default_caller_vmctx = inner.instance(id).vmctx();
+            inner.default_caller_vmctx = default_caller_vmctx.into();
+        }
 
         Self {
             inner: ManuallyDrop::new(inner),
@@ -775,10 +788,17 @@ impl<T> Store<T> {
     /// automatically happen according to various internal heuristics. This is
     /// provided if fine-grained control over the GC is desired.
     ///
+    /// If you are calling this method after an attempted allocation failed, you
+    /// may pass in the [`GcHeapOutOfMemory`][crate::GcHeapOutOfMemory] error.
+    /// When you do so, this method will attempt to create enough space in the
+    /// GC heap for that allocation, so that it will succeed on the next
+    /// attempt.
+    ///
     /// This method is only available when the `gc` Cargo feature is enabled.
     #[cfg(feature = "gc")]
-    pub fn gc(&mut self) {
-        self.inner.gc()
+    pub fn gc(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>) {
+        assert!(!self.inner.async_support());
+        self.inner.gc(why);
     }
 
     /// Returns the amount fuel in this [`Store`]. When fuel is enabled, it must
@@ -923,10 +943,10 @@ impl<T> Store<T> {
     /// add to the epoch deadline, as well as indicating what
     /// to do after the callback returns. If the [`Store`] is
     /// configured with async support, then the callback may return
-    /// [`UpdateDeadline::Yield`] to yield to the async executor before
-    /// updating the epoch deadline. Alternatively, the callback may
-    /// return [`UpdateDeadline::Continue`] to update the epoch deadline
-    /// immediately.
+    /// [`UpdateDeadline::Yield`] or [`UpdateDeadline::YieldCustom`]
+    /// to yield to the async executor before updating the epoch deadline.
+    /// Alternatively, the callback may return [`UpdateDeadline::Continue`] to
+    /// update the epoch deadline immediately.
     ///
     /// This setting is intended to allow for coarse-grained
     /// interruption, but not a deterministic deadline of a fixed,
@@ -996,8 +1016,8 @@ impl<'a, T> StoreContextMut<'a, T> {
     ///
     /// This method is only available when the `gc` Cargo feature is enabled.
     #[cfg(feature = "gc")]
-    pub fn gc(&mut self) {
-        self.0.gc()
+    pub fn gc(&mut self, why: Option<&crate::GcHeapOutOfMemory<()>>) {
+        self.0.gc(why);
     }
 
     /// Returns remaining fuel in this store.
@@ -1245,31 +1265,6 @@ impl StoreOpaque {
         }
     }
 
-    pub unsafe fn add_instance(
-        &mut self,
-        handle: InstanceHandle,
-        module_id: RegisteredModuleId,
-    ) -> InstanceId {
-        self.instances.push(StoreInstance {
-            handle: handle.clone(),
-            kind: StoreInstanceKind::Real { module_id },
-        });
-        InstanceId(self.instances.len() - 1)
-    }
-
-    /// Add a dummy instance that to the store.
-    ///
-    /// These are instances that are just implementation details of something
-    /// else (e.g. host-created memories that are not actually defined in any
-    /// Wasm module) and therefore shouldn't show up in things like core dumps.
-    pub unsafe fn add_dummy_instance(&mut self, handle: InstanceHandle) -> InstanceId {
-        self.instances.push(StoreInstance {
-            handle: handle.clone(),
-            kind: StoreInstanceKind::Dummy,
-        });
-        InstanceId(self.instances.len() - 1)
-    }
-
     pub fn instance(&self, id: InstanceId) -> &InstanceHandle {
         &self.instances[id.0].handle
     }
@@ -1410,31 +1405,78 @@ impl StoreOpaque {
 
     #[inline(never)]
     pub(crate) fn allocate_gc_heap(&mut self) -> Result<()> {
+        log::trace!("allocating GC heap for store {:?}", self.id());
+
         assert!(self.gc_store.is_none());
-        let gc_store = allocate_gc_store(self.engine())?;
+        assert_eq!(
+            self.vm_store_context.gc_heap.base.as_non_null(),
+            NonNull::dangling(),
+        );
+        assert_eq!(self.vm_store_context.gc_heap.current_length(), 0);
+
+        let vmstore = self.traitobj();
+        let gc_store = allocate_gc_store(self.engine(), vmstore, self.get_pkey())?;
+        self.vm_store_context.gc_heap = gc_store.vmmemory_definition();
         self.gc_store = Some(gc_store);
         return Ok(());
 
         #[cfg(feature = "gc")]
-        fn allocate_gc_store(engine: &Engine) -> Result<GcStore> {
+        fn allocate_gc_store(
+            engine: &Engine,
+            vmstore: NonNull<dyn vm::VMStore>,
+            pkey: Option<ProtectionKey>,
+        ) -> Result<GcStore> {
             ensure!(
                 engine.features().gc_types(),
                 "cannot allocate a GC store when GC is disabled at configuration time"
             );
-            let (index, heap) = engine
-                .allocator()
-                .allocate_gc_heap(engine, &**engine.gc_runtime()?)?;
+
+            // First, allocate the memory that will be our GC heap's storage.
+            let mut request = InstanceAllocationRequest {
+                id: InstanceId::INVALID,
+                runtime_info: &ModuleRuntimeInfo::bare(Arc::new(
+                    wasmtime_environ::Module::default(),
+                )),
+                imports: vm::Imports::default(),
+                host_state: Box::new(()),
+                store: StorePtr::new(vmstore),
+                wmemcheck: false,
+                pkey,
+                tunables: engine.tunables(),
+            };
+            let mem_ty = engine.tunables().gc_heap_memory_type();
+            let tunables = engine.tunables();
+
+            // SAFETY: We validated the GC heap's memory type during engine creation.
+            let (mem_alloc_index, mem) = unsafe {
+                engine
+                    .allocator()
+                    .allocate_memory(&mut request, &mem_ty, tunables, None)?
+            };
+
+            // Then, allocate the actual GC heap, passing in that memory
+            // storage.
+            let (index, heap) = engine.allocator().allocate_gc_heap(
+                engine,
+                &**engine.gc_runtime()?,
+                mem_alloc_index,
+                mem,
+            )?;
+
             Ok(GcStore::new(index, heap))
         }
 
         #[cfg(not(feature = "gc"))]
-        fn allocate_gc_store(_engine: &Engine) -> Result<GcStore> {
+        fn allocate_gc_store(
+            _engine: &Engine,
+            _vmstore: NonNull<dyn vm::VMStore>,
+            _pkey: Option<ProtectionKey>,
+        ) -> Result<GcStore> {
             bail!("cannot allocate a GC store: the `gc` feature was disabled at compile time")
         }
     }
 
     #[inline]
-    #[cfg(feature = "gc")]
     pub(crate) fn gc_store(&self) -> Result<&GcStore> {
         match &self.gc_store {
             Some(gc_store) => Ok(gc_store),
@@ -1453,15 +1495,30 @@ impl StoreOpaque {
     /// If this store is configured with a GC heap, return a mutable reference
     /// to it. Otherwise, return `None`.
     #[inline]
-    pub(crate) fn optional_gc_store_mut(&mut self) -> Result<Option<&mut GcStore>> {
+    pub(crate) fn optional_gc_store_mut(&mut self) -> Option<&mut GcStore> {
         if cfg!(not(feature = "gc")) || !self.engine.features().gc_types() {
-            Ok(None)
+            debug_assert!(self.gc_store.is_none());
+            None
         } else {
-            Ok(Some(self.gc_store_mut()?))
+            self.gc_store.as_mut()
+        }
+    }
+
+    /// If this store is configured with a GC heap, return a shared reference to
+    /// it. Otherwise, return `None`.
+    #[inline]
+    #[cfg(feature = "gc")]
+    pub(crate) fn optional_gc_store(&self) -> Option<&GcStore> {
+        if cfg!(not(feature = "gc")) || !self.engine.features().gc_types() {
+            debug_assert!(self.gc_store.is_none());
+            None
+        } else {
+            self.gc_store.as_ref()
         }
     }
 
     #[inline]
+    #[track_caller]
     #[cfg(feature = "gc")]
     pub(crate) fn unwrap_gc_store(&self) -> &GcStore {
         self.gc_store
@@ -1470,6 +1527,7 @@ impl StoreOpaque {
     }
 
     #[inline]
+    #[track_caller]
     pub(crate) fn unwrap_gc_store_mut(&mut self) -> &mut GcStore {
         self.gc_store
             .as_mut()
@@ -1493,7 +1551,12 @@ impl StoreOpaque {
     }
 
     #[cfg(feature = "gc")]
-    pub fn gc(&mut self) {
+    fn do_gc(&mut self) {
+        assert!(
+            !self.async_support(),
+            "must use `store.gc_async()` instead of `store.gc()` for async stores"
+        );
+
         // If the GC heap hasn't been initialized, there is nothing to collect.
         if self.gc_store.is_none() {
             return;
@@ -1513,16 +1576,6 @@ impl StoreOpaque {
         self.gc_roots_list = roots;
 
         log::trace!("============ End GC ===========");
-    }
-
-    #[inline]
-    #[cfg(not(feature = "gc"))]
-    pub fn gc(&mut self) {
-        // Nothing to collect.
-        //
-        // Note that this is *not* a public method, this is just defined for the
-        // crate-internal `StoreOpaque` type. This is a convenience so that we
-        // don't have to `cfg` every call site.
     }
 
     #[cfg(feature = "gc")]
@@ -1684,12 +1737,17 @@ impl StoreOpaque {
 
     #[inline]
     pub fn default_caller(&self) -> NonNull<VMContext> {
-        self.default_caller.vmctx()
+        self.default_caller_vmctx.as_non_null()
     }
 
     #[inline]
-    pub fn traitobj(&self) -> NonNull<dyn crate::runtime::vm::VMStore> {
-        self.default_caller.traitobj(self)
+    pub fn traitobj(&self) -> NonNull<dyn vm::VMStore> {
+        self.traitobj.as_raw().unwrap()
+    }
+
+    #[inline]
+    pub fn traitobj_mut(&mut self) -> &mut dyn vm::VMStore {
+        unsafe { self.traitobj().as_mut() }
     }
 
     /// Takes the cached `Vec<Val>` stored internally across hostcalls to get
@@ -1741,11 +1799,7 @@ impl StoreOpaque {
     /// with spectre mitigations enabled since the hardware fault address is
     /// always zero in these situations which means that the trapping context
     /// doesn't have enough information to report the fault address.
-    pub(crate) fn wasm_fault(
-        &self,
-        pc: usize,
-        addr: usize,
-    ) -> Option<crate::runtime::vm::WasmFault> {
+    pub(crate) fn wasm_fault(&self, pc: usize, addr: usize) -> Option<vm::WasmFault> {
         // There are a few instances where a "close to zero" pointer is loaded
         // and we expect that to happen:
         //
@@ -1844,8 +1898,8 @@ at https://bytecodealliance.org/security.
     pub(crate) fn component_resource_state(
         &mut self,
     ) -> (
-        &mut crate::runtime::vm::component::CallContexts,
-        &mut crate::runtime::vm::component::ResourceTable,
+        &mut vm::component::CallContexts,
+        &mut vm::component::ResourceTable,
         &mut crate::component::HostResourceData,
     ) {
         (
@@ -1880,14 +1934,120 @@ at https://bytecodealliance.org/security.
 
     pub(crate) fn unwinder(&self) -> &'static dyn Unwind {
         match &self.executor {
-            Executor::Interpreter(_) => &crate::runtime::vm::UnwindPulley,
+            Executor::Interpreter(_) => &vm::UnwindPulley,
             #[cfg(has_host_compiler_backend)]
-            Executor::Native => &crate::runtime::vm::UnwindHost,
+            Executor::Native => &vm::UnwindHost,
         }
+    }
+
+    /// Constructs and executes an `InstanceAllocationRequest` and pushes the
+    /// returned instance into the store.
+    ///
+    /// This is a helper method for invoking
+    /// `InstanceAllocator::allocate_module` with the appropriate parameters
+    /// from this store's own configuration. The `kind` provided is used to
+    /// distinguish between "real" modules and dummy ones that are synthesized
+    /// for embedder-created memories, globals, tables, etc. The `kind` will
+    /// also use a different instance allocator by default, the one passed in,
+    /// rather than the engine's default allocator.
+    ///
+    /// This method will push the instance within `StoreOpaque` onto the
+    /// `instances` array and return the `InstanceId` which can be use to look
+    /// it up within the store.
+    ///
+    /// # Safety
+    ///
+    /// The request's associated module, memories, tables, and vmctx must have
+    /// already have been validated by `validate_module` for the allocator
+    /// configured. This is typically done during module construction for
+    /// example.
+    pub(crate) unsafe fn allocate_instance(
+        &mut self,
+        kind: AllocateInstanceKind<'_>,
+        runtime_info: &ModuleRuntimeInfo,
+        imports: Imports<'_>,
+        host_state: Box<dyn Any + Send + Sync>,
+    ) -> Result<InstanceId> {
+        let id = InstanceId(self.instances.len());
+
+        let allocator = match kind {
+            AllocateInstanceKind::Module(_) => self.engine().allocator(),
+            AllocateInstanceKind::Dummy { allocator } => allocator,
+        };
+        let handle = allocator.allocate_module(InstanceAllocationRequest {
+            id,
+            runtime_info,
+            imports,
+            host_state,
+            store: StorePtr::new(self.traitobj()),
+            wmemcheck: self.engine().config().wmemcheck,
+            pkey: self.get_pkey(),
+            tunables: self.engine().tunables(),
+        })?;
+
+        match kind {
+            AllocateInstanceKind::Module(module_id) => {
+                log::trace!(
+                    "Adding instance to store: store={:?}, module={module_id:?}, instance={id:?}",
+                    self.id()
+                );
+                self.instances.push(StoreInstance {
+                    handle,
+                    kind: StoreInstanceKind::Real { module_id },
+                });
+            }
+            AllocateInstanceKind::Dummy { .. } => {
+                log::trace!(
+                    "Adding dummy instance to store: store={:?}, instance={id:?}",
+                    self.id()
+                );
+                self.instances.push(StoreInstance {
+                    handle,
+                    kind: StoreInstanceKind::Dummy,
+                });
+            }
+        }
+
+        // double-check we didn't accidentally allocate two instances and our
+        // prediction of what the id would be is indeed the id it should be.
+        assert_eq!(self.instances.len(), id.0 + 1);
+
+        Ok(id)
+    }
+
+    /// Returns the `StoreInstanceId` that can be used to re-acquire access to
+    /// `vmctx` from a store later on.
+    ///
+    /// # Safety
+    ///
+    /// This method is unsafe as it cannot validate that `vmctx` is a valid
+    /// allocation that lives within this store.
+    pub(crate) unsafe fn vmctx_id(&self, vmctx: NonNull<VMContext>) -> StoreInstanceId {
+        let instance_id = vm::Instance::from_vmctx(vmctx, |i| i.id());
+        StoreInstanceId::new(self.id(), instance_id)
     }
 }
 
-unsafe impl<T> crate::runtime::vm::VMStore for StoreInner<T> {
+/// Helper parameter to [`StoreOpaque::allocate_instance`].
+pub(crate) enum AllocateInstanceKind<'a> {
+    /// An embedder-provided module is being allocated meaning that the default
+    /// engine's allocator will be used.
+    Module(RegisteredModuleId),
+
+    /// Add a dummy instance that to the store.
+    ///
+    /// These are instances that are just implementation details of something
+    /// else (e.g. host-created memories that are not actually defined in any
+    /// Wasm module) and therefore shouldn't show up in things like core dumps.
+    ///
+    /// A custom, typically OnDemand-flavored, allocator is provided to execute
+    /// the allocation.
+    Dummy {
+        allocator: &'a dyn InstanceAllocator,
+    },
+}
+
+unsafe impl<T> vm::VMStore for StoreInner<T> {
     #[cfg(feature = "component-model-async")]
     fn component_async_store(
         &mut self,
@@ -2013,7 +2173,6 @@ unsafe impl<T> crate::runtime::vm::VMStore for StoreInner<T> {
             Some(callback) => callback((&mut *self).as_context_mut()).and_then(|update| {
                 let delta = match update {
                     UpdateDeadline::Continue(delta) => delta,
-
                     #[cfg(feature = "async")]
                     UpdateDeadline::Yield(delta) => {
                         assert!(
@@ -2023,6 +2182,27 @@ unsafe impl<T> crate::runtime::vm::VMStore for StoreInner<T> {
                         // Do the async yield. May return a trap if future was
                         // canceled while we're yielded.
                         self.async_yield_impl()?;
+                        delta
+                    }
+                    #[cfg(feature = "async")]
+                    UpdateDeadline::YieldCustom(delta, future) => {
+                        assert!(
+                            self.async_support(),
+                            "cannot use `UpdateDeadline::YieldCustom` without enabling async support in the config"
+                        );
+
+                        // When control returns, we have a `Result<()>` passed
+                        // in from the host fiber. If this finished successfully then
+                        // we were resumed normally via a `poll`, so keep going.  If
+                        // the future was dropped while we were yielded, then we need
+                        // to clean up this fiber. Do so by raising a trap which will
+                        // abort all wasm and get caught on the other side to clean
+                        // things up.
+                        unsafe {
+                            self.async_cx()
+                                .expect("attempted to pull async context during shutdown")
+                                .block_on(future)?
+                        }
                         delta
                     }
                 };
@@ -2040,46 +2220,25 @@ unsafe impl<T> crate::runtime::vm::VMStore for StoreInner<T> {
     }
 
     #[cfg(feature = "gc")]
-    fn maybe_async_gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
-        let mut scope = crate::RootScope::new(self);
-        let store = scope.as_context_mut().0;
-        let store_id = store.id();
-        let root = root.map(|r| store.gc_roots_mut().push_lifo_root(store_id, r));
-
-        if store.async_support() {
-            #[cfg(feature = "async")]
-            unsafe {
-                let async_cx = store.async_cx();
-                let future = store.gc_async();
-                async_cx
-                    .expect("attempted to pull async context during shutdown")
-                    .block_on(future)?;
-            }
-        } else {
-            (**store).gc();
-        }
-
-        let root = match root {
-            None => None,
-            Some(r) => {
-                let r = r
-                    .get_gc_ref(store)
-                    .expect("still in scope")
-                    .unchecked_copy();
-                Some(store.gc_store_mut()?.clone_gc_ref(&r))
-            }
-        };
-
-        Ok(root)
+    unsafe fn maybe_async_grow_or_collect_gc_heap(
+        &mut self,
+        root: Option<VMGcRef>,
+        bytes_needed: Option<u64>,
+    ) -> Result<Option<VMGcRef>> {
+        self.inner.maybe_async_gc(root, bytes_needed)
     }
 
     #[cfg(not(feature = "gc"))]
-    fn maybe_async_gc(&mut self, root: Option<VMGcRef>) -> Result<Option<VMGcRef>> {
+    unsafe fn maybe_async_grow_or_collect_gc_heap(
+        &mut self,
+        root: Option<VMGcRef>,
+        _bytes_needed: Option<u64>,
+    ) -> Result<Option<VMGcRef>> {
         Ok(root)
     }
 
     #[cfg(feature = "component-model")]
-    fn component_calls(&mut self) -> &mut crate::runtime::vm::component::CallContexts {
+    fn component_calls(&mut self) -> &mut vm::component::CallContexts {
         &mut self.component_calls
     }
 }
@@ -2168,19 +2327,26 @@ impl Drop for StoreOpaque {
         unsafe {
             let allocator = self.engine.allocator();
             let ondemand = OnDemandInstanceAllocator::default();
-            for instance in self.instances.iter_mut() {
+            let store_id = self.id();
+
+            #[cfg(feature = "gc")]
+            if let Some(gc_store) = self.gc_store.take() {
+                let gc_alloc_index = gc_store.allocation_index;
+                log::trace!("store {store_id:?} is deallocating GC heap {gc_alloc_index:?}");
+                debug_assert!(self.engine.features().gc_types());
+                let (mem_alloc_index, mem) =
+                    allocator.deallocate_gc_heap(gc_alloc_index, gc_store.gc_heap);
+                allocator.deallocate_memory(None, mem_alloc_index, mem);
+            }
+
+            for (idx, instance) in self.instances.iter_mut().enumerate() {
+                let id = InstanceId::from_index(idx);
+                log::trace!("store {store_id:?} is deallocating {id:?}");
                 if let StoreInstanceKind::Dummy = instance.kind {
                     ondemand.deallocate_module(&mut instance.handle);
                 } else {
                     allocator.deallocate_module(&mut instance.handle);
                 }
-            }
-            ondemand.deallocate_module(&mut self.default_caller);
-
-            #[cfg(feature = "gc")]
-            if let Some(gc_store) = self.gc_store.take() {
-                debug_assert!(self.engine.features().gc_types());
-                allocator.deallocate_gc_heap(gc_store.allocation_index, gc_store.gc_heap);
             }
 
             #[cfg(feature = "component-model")]

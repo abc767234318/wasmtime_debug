@@ -1,11 +1,12 @@
-use anyhow::{anyhow, bail, Context, Result};
+use crate::WastContext;
+use anyhow::{Context, Result, anyhow, bail};
 use std::fmt::{Display, LowerHex};
 use wasmtime::{AnyRef, ExternRef, Store, Val};
 use wast::core::{AbstractHeapType, HeapType, NanPattern, V128Pattern, WastArgCore, WastRetCore};
 use wast::token::{F32, F64};
 
 /// Translate from a `script::Value` to a `RuntimeValue`.
-pub fn val<T>(store: &mut Store<T>, v: &WastArgCore<'_>) -> Result<Val> {
+pub fn val<T>(ctx: &mut WastContext<T>, v: &WastArgCore<'_>) -> Result<Val> {
     use wast::core::WastArgCore::*;
 
     Ok(match v {
@@ -30,10 +31,18 @@ pub fn val<T>(store: &mut Store<T>, v: &WastArgCore<'_>) -> Result<Val> {
             shared: false,
             ty: AbstractHeapType::None,
         }) => Val::AnyRef(None),
-        RefExtern(x) => Val::ExternRef(Some(ExternRef::new(store, *x)?)),
+        RefExtern(x) => Val::ExternRef(if let Some(rt) = ctx.async_runtime.as_ref() {
+            Some(rt.block_on(ExternRef::new_async(&mut ctx.store, *x))?)
+        } else {
+            Some(ExternRef::new(&mut ctx.store, *x)?)
+        }),
         RefHost(x) => {
-            let x = ExternRef::new(&mut *store, *x)?;
-            let x = AnyRef::convert_extern(&mut *store, x)?;
+            let x = if let Some(rt) = ctx.async_runtime.as_ref() {
+                rt.block_on(ExternRef::new_async(&mut ctx.store, *x))?
+            } else {
+                ExternRef::new(&mut ctx.store, *x)?
+            };
+            let x = AnyRef::convert_extern(&mut ctx.store, x)?;
             Val::AnyRef(Some(x))
         }
         other => bail!("couldn't convert {:?} to a runtime value", other),

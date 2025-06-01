@@ -36,6 +36,7 @@ use std::cell::Cell;
 use std::io;
 use std::ops::Range;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub type Error = io::Error;
 
@@ -59,8 +60,26 @@ enum FiberStackStorage {
     Custom(Box<dyn RuntimeFiberStack>),
 }
 
+// FIXME: this is a duplicate copy of what's already in the `wasmtime` crate. If
+// this changes that should change over there, and ideally one day we should
+// probably deduplicate the two.
+fn host_page_size() -> usize {
+    static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+    return match PAGE_SIZE.load(Ordering::Relaxed) {
+        0 => {
+            let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE).try_into().unwrap() };
+            assert!(size != 0);
+            PAGE_SIZE.store(size, Ordering::Relaxed);
+            size
+        }
+        n => n,
+    };
+}
+
 impl FiberStack {
     pub fn new(size: usize, zeroed: bool) -> io::Result<Self> {
+        let page_size = host_page_size();
         // The anonymous `mmap`s we use for `FiberStackStorage` are alawys
         // zeroed.
         let _ = zeroed;
@@ -70,7 +89,6 @@ impl FiberStack {
         if cfg!(asan) {
             return Self::from_custom(asan::new_fiber_stack(size)?);
         }
-        let page_size = rustix::param::page_size();
         let stack = MmapFiberStack::new(size)?;
 
         // An `MmapFiberStack` allocates a guard page at the bottom of the
@@ -90,7 +108,7 @@ impl FiberStack {
             return Self::from_custom(asan::new_fiber_stack(len)?);
         }
         Ok(FiberStack {
-            base: BasePtr(base.add(guard_size)),
+            base: BasePtr(unsafe { base.add(guard_size) }),
             len,
             storage: FiberStackStorage::Unmanaged(guard_size),
         })
@@ -102,7 +120,7 @@ impl FiberStack {
 
     pub fn from_custom(custom: Box<dyn RuntimeFiberStack>) -> io::Result<Self> {
         let range = custom.range();
-        let page_size = rustix::param::page_size();
+        let page_size = host_page_size();
         let start_ptr = range.start as *mut u8;
         assert!(
             start_ptr.align_offset(page_size) == 0,
@@ -153,7 +171,7 @@ impl MmapFiberStack {
     fn new(size: usize) -> io::Result<Self> {
         // Round up our stack size request to the nearest multiple of the
         // page size.
-        let page_size = rustix::param::page_size();
+        let page_size = host_page_size();
         let size = if size == 0 {
             page_size
         } else {
@@ -277,16 +295,20 @@ impl Suspend {
     }
 
     unsafe fn take_resume<A, B, C>(&self) -> A {
-        match (*self.result_location::<A, B, C>()).replace(RunResult::Executing) {
-            RunResult::Resuming(val) => val,
-            _ => panic!("not in resuming state"),
+        unsafe {
+            match (*self.result_location::<A, B, C>()).replace(RunResult::Executing) {
+                RunResult::Resuming(val) => val,
+                _ => panic!("not in resuming state"),
+            }
         }
     }
 
     unsafe fn result_location<A, B, C>(&self) -> *const Cell<RunResult<A, B, C>> {
-        let ret = self.top_of_stack.cast::<*const u8>().offset(-1).read();
-        assert!(!ret.is_null());
-        ret.cast()
+        unsafe {
+            let ret = self.top_of_stack.cast::<*const u8>().offset(-1).read();
+            assert!(!ret.is_null());
+            ret.cast()
+        }
     }
 }
 
@@ -302,10 +324,9 @@ impl Suspend {
 /// called around every stack switch with some other fiddly bits as well.
 #[cfg(asan)]
 mod asan {
-    use super::{FiberStack, MmapFiberStack, RuntimeFiberStack};
+    use super::{FiberStack, MmapFiberStack, RuntimeFiberStack, host_page_size};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use rustix::param::page_size;
     use std::mem::ManuallyDrop;
     use std::ops::Range;
     use std::sync::Mutex;
@@ -370,15 +391,19 @@ mod asan {
         // trigger false positives in ASAN. That leads to the design of this
         // module as-is where this function exists to have these three
         // functions very close to one another.
-        __sanitizer_start_switch_fiber(private_asan_pointer_ref, prev.bottom, prev.size);
-        super::wasmtime_fiber_switch(top_of_stack);
-        __sanitizer_finish_switch_fiber(private_asan_pointer, &mut prev.bottom, &mut prev.size);
+        unsafe {
+            __sanitizer_start_switch_fiber(private_asan_pointer_ref, prev.bottom, prev.size);
+            super::wasmtime_fiber_switch(top_of_stack);
+            __sanitizer_finish_switch_fiber(private_asan_pointer, &mut prev.bottom, &mut prev.size);
+        }
     }
 
     /// Hook for when a fiber first starts, used to configure ASAN.
     pub unsafe fn fiber_start_complete() -> PreviousStack {
         let mut ret = PreviousStack::default();
-        __sanitizer_finish_switch_fiber(std::ptr::null_mut(), &mut ret.bottom, &mut ret.size);
+        unsafe {
+            __sanitizer_finish_switch_fiber(std::ptr::null_mut(), &mut ret.bottom, &mut ret.size);
+        }
         ret
     }
 
@@ -418,7 +443,8 @@ mod asan {
     static FIBER_STACKS: Mutex<Vec<MmapFiberStack>> = Mutex::new(Vec::new());
 
     pub fn new_fiber_stack(size: usize) -> std::io::Result<Box<dyn RuntimeFiberStack>> {
-        let needed_size = size + page_size();
+        let page_size = host_page_size();
+        let needed_size = size + page_size;
         let mut stacks = FIBER_STACKS.lock().unwrap();
 
         let stack = match stacks.iter().position(|i| needed_size <= i.mapping_len) {
@@ -428,7 +454,9 @@ mod asan {
             // ... otherwise allocate a brand new stack.
             None => MmapFiberStack::new(size)?,
         };
-        let stack = AsanFiberStack(ManuallyDrop::new(stack));
+        let stack = AsanFiberStack {
+            mmap: ManuallyDrop::new(stack),
+        };
         Ok(Box::new(stack))
     }
 
@@ -437,27 +465,31 @@ mod asan {
     ///
     /// On drop this stack will return the interior stack to the global
     /// `FIBER_STACKS` list.
-    struct AsanFiberStack(ManuallyDrop<MmapFiberStack>);
+    struct AsanFiberStack {
+        mmap: ManuallyDrop<MmapFiberStack>,
+    }
 
     unsafe impl RuntimeFiberStack for AsanFiberStack {
         fn top(&self) -> *mut u8 {
-            self.0.mapping_base.wrapping_byte_add(self.0.mapping_len)
+            self.mmap
+                .mapping_base
+                .wrapping_byte_add(self.mmap.mapping_len)
         }
 
         fn range(&self) -> Range<usize> {
-            let base = self.0.mapping_base as usize;
-            let end = base + self.0.mapping_len;
-            base + page_size()..end
+            let base = self.mmap.mapping_base as usize;
+            let end = base + self.mmap.mapping_len;
+            base + host_page_size()..end
         }
 
         fn guard_range(&self) -> Range<*mut u8> {
-            self.0.mapping_base..self.0.mapping_base.wrapping_add(page_size())
+            self.mmap.mapping_base..self.mmap.mapping_base.wrapping_add(host_page_size())
         }
     }
 
     impl Drop for AsanFiberStack {
         fn drop(&mut self) {
-            let stack = unsafe { ManuallyDrop::take(&mut self.0) };
+            let stack = unsafe { ManuallyDrop::take(&mut self.mmap) };
             FIBER_STACKS.lock().unwrap().push(stack);
         }
     }
@@ -485,7 +517,9 @@ mod asan_disabled {
         _prev: &mut PreviousStack,
     ) {
         assert!(super::SUPPORTED_ARCH);
-        super::wasmtime_fiber_switch(top_of_stack);
+        unsafe {
+            super::wasmtime_fiber_switch(top_of_stack);
+        }
     }
 
     #[inline]

@@ -346,10 +346,9 @@ impl<'a> Module<'a> {
             } else {
                 ValType::I32
             };
-            let ty = self.core_types.function(
-                &[ptr, ValType::I32, ValType::I32, ValType::I32],
-                &[ValType::I32],
-            );
+            let ty = self
+                .core_types
+                .function(&[ptr, ValType::I32, ValType::I32], &[ValType::I32]);
             self.import_func(
                 "callback",
                 &format!("f{}", self.imported_funcs.len()),
@@ -511,10 +510,11 @@ impl<'a> Module<'a> {
             Import::SyncEnterCall,
             |me| me.imported_sync_enter_call.get(suffix).copied(),
             |me, v| {
-                assert!(me
-                    .imported_sync_enter_call
-                    .insert(suffix.to_owned(), v)
-                    .is_none())
+                assert!(
+                    me.imported_sync_enter_call
+                        .insert(suffix.to_owned(), v)
+                        .is_none()
+                )
             },
         )
     }
@@ -547,10 +547,11 @@ impl<'a> Module<'a> {
             },
             |me| me.imported_sync_exit_call.get(suffix).copied(),
             |me, v| {
-                assert!(me
-                    .imported_sync_exit_call
-                    .insert(suffix.to_owned(), v)
-                    .is_none())
+                assert!(
+                    me.imported_sync_exit_call
+                        .insert(suffix.to_owned(), v)
+                        .is_none()
+                )
             },
         )
     }
@@ -860,11 +861,7 @@ impl Options {
     }
 
     fn ptr_size(&self) -> u8 {
-        if self.memory64 {
-            8
-        } else {
-            4
-        }
+        if self.memory64 { 8 } else { 4 }
     }
 
     fn flat_types<'a>(

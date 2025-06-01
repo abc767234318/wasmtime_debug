@@ -6,7 +6,7 @@
 //! option parsing is contained exclusively within this module.
 
 use crate::{KeyValuePair, WasiNnGraph};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::builder::{StringValueParser, TypedValueParser, ValueParserFactory};
 use clap::error::{Error, ErrorKind};
 use serde::de::{self, Visitor};
@@ -250,11 +250,7 @@ where
                 .filter_map(|d| match d.name {
                     OptName::Name(s) => {
                         let s = s.replace('_', "-");
-                        if s == key {
-                            Some((d, s))
-                        } else {
-                            None
-                        }
+                        if s == key { Some((d, s)) } else { None }
                     }
                     OptName::Prefix(s) => {
                         let name = key.strip_prefix(s)?.strip_prefix("-")?;
@@ -486,7 +482,6 @@ impl WasmtimeOptionValue for wasmtime::RegallocAlgorithm {
     fn parse(val: Option<&str>) -> Result<Self> {
         match String::parse(val)?.as_str() {
             "backtracking" => Ok(wasmtime::RegallocAlgorithm::Backtracking),
-            "single-pass" => Ok(wasmtime::RegallocAlgorithm::SinglePass),
             other => bail!(
                 "unknown regalloc algorithm`{}`, only backtracking,single-pass accepted",
                 other
@@ -497,7 +492,6 @@ impl WasmtimeOptionValue for wasmtime::RegallocAlgorithm {
     fn display(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             wasmtime::RegallocAlgorithm::Backtracking => f.write_str("backtracking"),
-            wasmtime::RegallocAlgorithm::SinglePass => f.write_str("single-pass"),
             _ => unreachable!(),
         }
     }

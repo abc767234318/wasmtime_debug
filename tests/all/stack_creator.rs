@@ -1,5 +1,5 @@
 #![cfg(all(not(target_os = "windows"), not(miri)))]
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     ops::Range,
@@ -128,6 +128,7 @@ fn config() -> (Store<()>, Arc<CustomStackCreator>) {
 }
 
 #[tokio::test]
+#[cfg_attr(asan, ignore)]
 async fn called_on_custom_heap_stack() -> Result<()> {
     let (mut store, stack_creator) = config();
     let module = Module::new(

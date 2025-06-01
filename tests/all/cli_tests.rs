@@ -1,6 +1,6 @@
 #![cfg(not(miri))]
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -552,8 +552,12 @@ fn run_cwasm_from_stdin() -> Result<()> {
 #[cfg(feature = "wasi-threads")]
 #[test]
 fn run_threads() -> Result<()> {
-    // Skip this test on platforms that don't support threads.
-    if crate::threads::engine().is_none() {
+    // Only run threaded tests on platforms that support threads. Also skip
+    // these tests with ASAN as it, rightfully, complains about a memory leak.
+    // The memory leak at this time is that child threads aren't joined with the
+    // main thread, meaning that allocations done on child threads are indeed
+    // leaked.
+    if crate::threads::engine().is_none() || cfg!(asan) {
         return Ok(());
     }
     let wasm = build_wasm("tests/all/cli_tests/threads.wat")?;
@@ -857,7 +861,10 @@ fn run_precompiled_component() -> Result<()> {
     Ok(())
 }
 
+// Disable test on s390x because the large allocation may actually succeed;
+// the whole 64-bit address space is available on this platform.
 #[test]
+#[cfg(not(target_arch = "s390x"))]
 fn memory_growth_failure() -> Result<()> {
     let output = get_wasmtime_command()?
         .args(&[
@@ -1097,7 +1104,7 @@ fn increase_stack_size() -> Result<()> {
 
 mod test_programs {
     use super::{get_wasmtime_command, run_wasmtime};
-    use anyhow::{bail, Context, Result};
+    use anyhow::{Context, Result, bail};
     use http_body_util::BodyExt;
     use hyper::header::HeaderValue;
     use std::io::{BufRead, BufReader, Read, Write};
@@ -1108,7 +1115,7 @@ mod test_programs {
 
     macro_rules! assert_test_exists {
         ($name:ident) => {
-            #[allow(unused_imports)]
+            #[expect(unused_imports, reason = "just here to assert the test is here")]
             use self::$name as _;
         };
     }
@@ -1116,14 +1123,7 @@ mod test_programs {
 
     #[test]
     fn cli_hello_stdout() -> Result<()> {
-        run_wasmtime(&[
-            "run",
-            "-Wcomponent-model",
-            CLI_HELLO_STDOUT_COMPONENT,
-            "gussie",
-            "sparky",
-            "willa",
-        ])?;
+        run_wasmtime(&["run", "-Wcomponent-model", CLI_HELLO_STDOUT_COMPONENT])?;
         Ok(())
     }
 
@@ -1746,9 +1746,9 @@ mod test_programs {
 
     #[tokio::test]
     #[ignore] // TODO: printing stderr in the child and killing the child at the
-              // end of this test race so the stderr may be present or not. Need
-              // to implement a more graceful shutdown routine for `wasmtime
-              // serve`.
+    // end of this test race so the stderr may be present or not. Need
+    // to implement a more graceful shutdown routine for `wasmtime
+    // serve`.
     async fn cli_serve_respect_pooling_options() -> Result<()> {
         let server = WasmtimeServe::new(CLI_SERVE_ECHO_ENV_COMPONENT, |cmd| {
             cmd.arg("-Opooling-total-memories=0").arg("-Scli");
@@ -2096,8 +2096,9 @@ after empty
                         .body(String::new())
                         .context("failed to make request")?,
                 )
-                .await;
-            assert!(res.is_err());
+                .await
+                .expect("got response from wasmtime");
+            assert_eq!(res.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
         }
 
         let (stdout, stderr) = server.finish()?;
@@ -2116,6 +2117,26 @@ after empty
     #[tokio::test]
     async fn cli_serve_trap_before_set() -> Result<()> {
         cli_serve_guest_never_invoked_set(CLI_SERVE_TRAP_BEFORE_SET_COMPONENT).await
+    }
+
+    mod invoke {
+        use super::*;
+
+        #[test]
+        fn cli_hello_stdout() -> Result<()> {
+            println!("{CLI_HELLO_STDOUT_COMPONENT}");
+            let output = run_wasmtime(&[
+                "run",
+                "-Wcomponent-model",
+                "--invoke",
+                "run()",
+                CLI_HELLO_STDOUT_COMPONENT,
+            ])?;
+            // First this component prints "hello, world", then the invoke
+            // result is printed as "ok".
+            assert_eq!(output, "hello, world\nok\n");
+            Ok(())
+        }
     }
 }
 
@@ -2197,14 +2218,10 @@ fn config_cli_flag() -> Result<()> {
         br#"
         [optimize]
         opt-level = 2
-        regalloc-algorithm = "single-pass"
         signals-based-traps = false
 
         [codegen]
         collector = "null"
-
-        [debug]
-        debug-info = true
 
         [wasm]
         max-wasm-stack = 65536
@@ -2403,5 +2420,35 @@ fn compilation_logs() -> Result<()> {
         println!("stderr: {}", String::from_utf8_lossy(&output.stderr));
         panic!("wasmtime compilation failed when logs requested");
     }
+    Ok(())
+}
+
+#[test]
+fn big_table_in_pooling_allocator() -> Result<()> {
+    // Works by default
+    run_wasmtime(&["tests/all/cli_tests/big_table.wat"])?;
+
+    // Does not work by default in the pooling allocator, and the error message
+    // should mention something about the pooling allocator.
+    let output = run_wasmtime_for_output(
+        &["-Opooling-allocator", "tests/all/cli_tests/big_table.wat"],
+        None,
+    )?;
+    assert!(!output.status.success());
+    println!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pooling allocator"));
+
+    // Does work with `-Wmax-table-elements`
+    run_wasmtime(&[
+        "-Opooling-allocator",
+        "-Wmax-table-elements=25000",
+        "tests/all/cli_tests/big_table.wat",
+    ])?;
+    // Also works with `-Opooling-table-elements`
+    run_wasmtime(&[
+        "-Opooling-allocator",
+        "-Opooling-table-elements=25000",
+        "tests/all/cli_tests/big_table.wat",
+    ])?;
     Ok(())
 }

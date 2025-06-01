@@ -51,7 +51,7 @@ macro_rules! impl_reg {
             const RANGE: Range<u8> = $range;
 
             unsafe fn new_unchecked(index: u8) -> Self {
-                core::mem::transmute(index)
+                unsafe { core::mem::transmute(index) }
             }
 
             fn to_u8(self) -> u8 {
@@ -259,9 +259,9 @@ impl<R: Reg> From<ScalarBitSet<u16>> for UpperRegSet<R> {
     }
 }
 
-impl<R: Reg> Into<ScalarBitSet<u16>> for UpperRegSet<R> {
-    fn into(self) -> ScalarBitSet<u16> {
-        self.bitset
+impl<R: Reg> From<UpperRegSet<R>> for ScalarBitSet<u16> {
+    fn from(upper: UpperRegSet<R>) -> ScalarBitSet<u16> {
+        upper.bitset
     }
 }
 
@@ -321,7 +321,7 @@ impl<R: Reg> Eq for UpperRegSet<R> {}
 
 impl<R: Reg> fmt::Debug for UpperRegSet<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_set().entries(self.into_iter()).finish()
+        f.debug_set().entries(*self).finish()
     }
 }
 

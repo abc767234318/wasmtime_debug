@@ -8,16 +8,15 @@ use crate::translate::{
 use crate::{BuiltinFunctionSignatures, TRAP_INTERNAL_ASSERT};
 use cranelift_codegen::cursor::FuncCursor;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::immediates::{Imm64, Offset32};
+use cranelift_codegen::ir::immediates::{Imm64, Offset32, V128Imm};
 use cranelift_codegen::ir::pcc::Fact;
 use cranelift_codegen::ir::types::*;
 use cranelift_codegen::ir::{self, types};
-use cranelift_codegen::ir::{ArgumentPurpose, Function, InstBuilder, MemFlags};
+use cranelift_codegen::ir::{ArgumentPurpose, ConstantData, Function, InstBuilder, MemFlags};
 use cranelift_codegen::isa::{TargetFrontendConfig, TargetIsa};
-use cranelift_entity::packed_option::ReservedValue;
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
-use cranelift_frontend::FunctionBuilder;
 use cranelift_frontend::Variable;
+use cranelift_frontend::{FuncInstBuilder, FunctionBuilder};
 use smallvec::SmallVec;
 use std::mem;
 use wasmparser::{Operator, WasmFeatures};
@@ -98,12 +97,24 @@ pub struct FuncEnvironment<'module_environment> {
     types: &'module_environment ModuleTypesBuilder,
     wasm_func_ty: &'module_environment WasmFuncType,
     sig_ref_to_ty: SecondaryMap<ir::SigRef, Option<&'module_environment WasmFuncType>>,
+    needs_gc_heap: bool,
 
     #[cfg(feature = "gc")]
     ty_to_gc_layout: std::collections::HashMap<
         wasmtime_environ::ModuleInternedTypeIndex,
         wasmtime_environ::GcLayout,
     >,
+
+    #[cfg(feature = "gc")]
+    gc_heap: Option<Heap>,
+
+    /// The Cranelift global holding the GC heap's base address.
+    #[cfg(feature = "gc")]
+    gc_heap_base: Option<ir::GlobalValue>,
+
+    /// The Cranelift global holding the GC heap's base address.
+    #[cfg(feature = "gc")]
+    gc_heap_bound: Option<ir::GlobalValue>,
 
     #[cfg(feature = "wmemcheck")]
     translation: &'module_environment ModuleTranslation<'module_environment>,
@@ -116,6 +127,9 @@ pub struct FuncEnvironment<'module_environment> {
 
     /// The Cranelift global holding the vmctx address.
     vmctx: Option<ir::GlobalValue>,
+
+    /// The Cranelift global for our vmctx's `*mut VMStoreContext`.
+    vm_store_context: Option<ir::GlobalValue>,
 
     /// The PCC memory type describing the vmctx layout, if we're
     /// using PCC.
@@ -134,12 +148,6 @@ pub struct FuncEnvironment<'module_environment> {
     /// stored locally as a variable instead of always referenced from the field
     /// in `*const VMStoreContext`
     fuel_var: cranelift_frontend::Variable,
-
-    /// A function-local variable which caches the value of `*const
-    /// VMStoreContext` for this function's vmctx argument. This pointer is stored
-    /// in the vmctx itself, but never changes for the lifetime of the function,
-    /// so if we load it up front we can continue to use it throughout.
-    vmstore_context_ptr: ir::Value,
 
     /// A cached epoch deadline value, when performing epoch-based
     /// interruption. Loaded from `VMStoreContext` and reloaded after
@@ -187,13 +195,21 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             types,
             wasm_func_ty,
             sig_ref_to_ty: SecondaryMap::default(),
+            needs_gc_heap: false,
 
             #[cfg(feature = "gc")]
             ty_to_gc_layout: std::collections::HashMap::new(),
+            #[cfg(feature = "gc")]
+            gc_heap: None,
+            #[cfg(feature = "gc")]
+            gc_heap_base: None,
+            #[cfg(feature = "gc")]
+            gc_heap_bound: None,
 
             heaps: PrimaryMap::default(),
             tables: SecondaryMap::default(),
             vmctx: None,
+            vm_store_context: None,
             pcc_vmctx_memtype: None,
             builtin_functions,
             offsets: VMOffsets::new(compiler.isa().pointer_bytes(), &translation.module),
@@ -201,7 +217,6 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             fuel_var: Variable::new(0),
             epoch_deadline_var: Variable::new(0),
             epoch_ptr_var: Variable::new(0),
-            vmstore_context_ptr: ir::Value::reserved_value(),
 
             // Start with at least one fuel being consumed because even empty
             // functions should consume at least some fuel.
@@ -306,22 +321,29 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         }
     }
 
-    fn declare_vmstore_context_ptr(&mut self, builder: &mut FunctionBuilder<'_>) {
-        // We load the `*const VMStoreContext` value stored within vmctx at the
-        // head of the function and reuse the same value across the entire
-        // function. This is possible since we know that the pointer never
-        // changes for the lifetime of the function.
-        let pointer_type = self.pointer_type();
-        let vmctx = self.vmctx(builder.func);
-        let base = builder.ins().global_value(pointer_type, vmctx);
-        let offset = i32::from(self.offsets.ptr.vmctx_runtime_limits());
-        debug_assert!(self.vmstore_context_ptr.is_reserved_value());
-        self.vmstore_context_ptr = builder.ins().load(
-            pointer_type,
-            ir::MemFlags::trusted().with_readonly().with_can_move(),
+    /// Get or create the `ir::Global` for the `*mut VMStoreContext` in our
+    /// `VMContext`.
+    fn get_vmstore_context_ptr_global(&mut self, func: &mut ir::Function) -> ir::GlobalValue {
+        if let Some(ptr) = self.vm_store_context {
+            return ptr;
+        }
+
+        let offset = self.offsets.ptr.vmctx_store_context();
+        let base = self.vmctx(func);
+        let ptr = func.create_global_value(ir::GlobalValueData::Load {
             base,
-            offset,
-        );
+            offset: Offset32::new(offset.into()),
+            global_type: self.pointer_type(),
+            flags: ir::MemFlags::trusted().with_readonly().with_can_move(),
+        });
+        self.vm_store_context = Some(ptr);
+        ptr
+    }
+
+    /// Get the `*mut VMStoreContext` value for our `VMContext`.
+    fn get_vmstore_context_ptr(&mut self, builder: &mut FunctionBuilder) -> ir::Value {
+        let global = self.get_vmstore_context_ptr_global(&mut builder.func);
+        builder.ins().global_value(self.pointer_type(), global)
     }
 
     fn fuel_function_entry(&mut self, builder: &mut FunctionBuilder<'_>) {
@@ -469,7 +491,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
     /// Loads the fuel consumption value from `VMStoreContext` into `self.fuel_var`
     fn fuel_load_into_var(&mut self, builder: &mut FunctionBuilder<'_>) {
-        let (addr, offset) = self.fuel_addr_offset();
+        let (addr, offset) = self.fuel_addr_offset(builder);
         let fuel = builder
             .ins()
             .load(ir::types::I64, ir::MemFlags::trusted(), addr, offset);
@@ -479,7 +501,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     /// Stores the fuel consumption value from `self.fuel_var` into
     /// `VMStoreContext`.
     fn fuel_save_from_var(&mut self, builder: &mut FunctionBuilder<'_>) {
-        let (addr, offset) = self.fuel_addr_offset();
+        let (addr, offset) = self.fuel_addr_offset(builder);
         let fuel_consumed = builder.use_var(self.fuel_var);
         builder
             .ins()
@@ -488,10 +510,13 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
 
     /// Returns the `(address, offset)` of the fuel consumption within
     /// `VMStoreContext`, used to perform loads/stores later.
-    fn fuel_addr_offset(&mut self) -> (ir::Value, ir::immediates::Offset32) {
-        debug_assert!(!self.vmstore_context_ptr.is_reserved_value());
+    fn fuel_addr_offset(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> (ir::Value, ir::immediates::Offset32) {
+        let vmstore_ctx = self.get_vmstore_context_ptr(builder);
         (
-            self.vmstore_context_ptr,
+            vmstore_ctx,
             i32::from(self.offsets.ptr.vmstore_context_fuel_consumed()).into(),
         )
     }
@@ -676,10 +701,11 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         // We keep the deadline cached in a register to speed the checks
         // in the common case (between epoch ticks) but we want to do a
         // precise check here by reloading the cache first.
+        let vmstore_ctx = self.get_vmstore_context_ptr(builder);
         let deadline = builder.ins().load(
             ir::types::I64,
             ir::MemFlags::trusted(),
-            self.vmstore_context_ptr,
+            vmstore_ctx,
             ir::immediates::Offset32::new(self.offsets.ptr.vmstore_context_epoch_deadline() as i32),
         );
         builder.def_var(self.epoch_deadline_var, deadline);
@@ -807,7 +833,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
                 .unwrap();
                 (vmctx, base_offset, current_elements_offset)
             } else {
-                let from_offset = self.offsets.vmctx_vmtable_import_from(index);
+                let from_offset = self.offsets.vmctx_vmtable_from(index);
                 let table = func.create_global_value(ir::GlobalValueData::Load {
                     base: vmctx,
                     offset: Offset32::new(i32::try_from(from_offset).unwrap()),
@@ -907,9 +933,13 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         let result_param = builder.append_block_param(continuation_block, pointer_type);
         builder.set_cold_block(null_block);
 
-        builder
-            .ins()
-            .brif(value, continuation_block, &[value_masked], null_block, &[]);
+        builder.ins().brif(
+            value,
+            continuation_block,
+            &[value_masked.into()],
+            null_block,
+            &[],
+        );
         builder.seal_block(null_block);
 
         builder.switch_to_block(null_block);
@@ -922,7 +952,9 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         let index = self.cast_index_to_i64(&mut builder.cursor(), index, index_type);
         let call_inst = builder.ins().call(lazy_init, &[vmctx, table_index, index]);
         let returned_entry = builder.func.dfg.inst_results(call_inst)[0];
-        builder.ins().jump(continuation_block, &[returned_entry]);
+        builder
+            .ins()
+            .jump(continuation_block, &[returned_entry.into()]);
         builder.seal_block(continuation_block);
 
         builder.switch_to_block(continuation_block);
@@ -1007,37 +1039,49 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         }
     }
 
-    /// Add one level of indirection to a pointer-and-memtype pair:
-    /// generate a load in the code at the specified offset, and if
-    /// memtypes are in use, add a field to the original struct and
-    /// generate a new memtype for the pointee.
-    fn load_pointer_with_memtypes(
+    /// Create an `ir::Global` that does `load(ptr + offset)` and, when PCC and
+    /// memory types are enabled, adds a field to the pointer's memory type for
+    /// this value we are loading.
+    pub(crate) fn global_load_with_memory_type(
         &mut self,
         func: &mut ir::Function,
+        ptr: ir::GlobalValue,
         offset: u32,
-        readonly: bool,
-        memtype: Option<ir::MemoryType>,
+        flags: ir::MemFlags,
+        ptr_mem_ty: Option<ir::MemoryType>,
     ) -> (ir::GlobalValue, Option<ir::MemoryType>) {
-        let vmctx = self.vmctx(func);
         let pointee = func.create_global_value(ir::GlobalValueData::Load {
-            base: vmctx,
+            base: ptr,
             offset: Offset32::new(i32::try_from(offset).unwrap()),
             global_type: self.pointer_type(),
-            flags: MemFlags::trusted().with_readonly().with_can_move(),
+            flags,
         });
 
-        let mt = memtype.map(|mt| {
-            let pointee_mt = self.create_empty_struct_memtype(func);
-            self.add_field_to_memtype(func, mt, offset, pointee_mt, readonly);
+        let pointee_mem_ty = ptr_mem_ty.map(|ptr_mem_ty| {
+            let pointee_mem_ty = self.create_empty_struct_memtype(func);
+            self.add_field_to_memtype(func, ptr_mem_ty, offset, pointee_mem_ty, flags.readonly());
             func.global_value_facts[pointee] = Some(Fact::Mem {
-                ty: pointee_mt,
+                ty: pointee_mem_ty,
                 min_offset: 0,
                 max_offset: 0,
                 nullable: false,
             });
-            pointee_mt
+            pointee_mem_ty
         });
-        (pointee, mt)
+
+        (pointee, pointee_mem_ty)
+    }
+
+    /// Like `global_load_with_memory_type` but specialized for loads out of the
+    /// `vmctx`.
+    pub(crate) fn global_load_from_vmctx_with_memory_type(
+        &mut self,
+        func: &mut ir::Function,
+        offset: u32,
+        flags: ir::MemFlags,
+    ) -> (ir::GlobalValue, Option<ir::MemoryType>) {
+        let vmctx = self.vmctx(func);
+        self.global_load_with_memory_type(func, vmctx, offset, flags, self.pcc_vmctx_memtype)
     }
 
     /// Helper to emit a conditional trap based on `trap_cond`.
@@ -1125,7 +1169,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         };
         let isnan = builder.ins().fcmp(FloatCC::NotEqual, val, val);
         self.trapnz(builder, isnan, ir::TrapCode::BAD_CONVERSION_TO_INTEGER);
-        let val = builder.ins().trunc(val);
+        let val = self.trunc_f64(builder, val);
         let (lower_bound, upper_bound) = match ty {
             I32 => range32,
             I64 => range64,
@@ -1193,6 +1237,11 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
             funcref,
             i32::from(self.offsets.ptr.vm_func_ref_type_index()),
         )
+    }
+
+    /// Does this function need a GC heap?
+    pub fn needs_gc_heap(&self) -> bool {
+        self.needs_gc_heap
     }
 }
 
@@ -2316,7 +2365,7 @@ impl FuncEnvironment<'_> {
         let memory = self.module.memories[index];
         let is_shared = memory.shared;
 
-        let (ptr, base_offset, current_length_offset, ptr_memtype) = {
+        let (base_ptr, base_offset, current_length_offset, ptr_memtype) = {
             let vmctx = self.vmctx(func);
             if let Some(def_index) = self.module.defined_memory_index(index) {
                 if is_shared {
@@ -2325,11 +2374,10 @@ impl FuncEnvironment<'_> {
                     // VMMemoryDefinition` to it and dereference that when
                     // atomically growing it.
                     let from_offset = self.offsets.vmctx_vmmemory_pointer(def_index);
-                    let (memory, def_mt) = self.load_pointer_with_memtypes(
+                    let (memory, def_mt) = self.global_load_from_vmctx_with_memory_type(
                         func,
                         from_offset,
-                        true,
-                        self.pcc_vmctx_memtype,
+                        ir::MemFlags::trusted().with_readonly().with_can_move(),
                     );
                     let base_offset = i32::from(self.offsets.ptr.vmmemory_definition_base());
                     let current_length_offset =
@@ -2353,11 +2401,10 @@ impl FuncEnvironment<'_> {
                 }
             } else {
                 let from_offset = self.offsets.vmctx_vmmemory_import_from(index);
-                let (memory, def_mt) = self.load_pointer_with_memtypes(
+                let (memory, def_mt) = self.global_load_from_vmctx_with_memory_type(
                     func,
                     from_offset,
-                    true,
-                    self.pcc_vmctx_memtype,
+                    ir::MemFlags::trusted().with_readonly().with_can_move(),
                 );
                 let base_offset = i32::from(self.offsets.ptr.vmmemory_definition_base());
                 let current_length_offset =
@@ -2366,13 +2413,66 @@ impl FuncEnvironment<'_> {
             }
         };
 
-        let heap_bound = func.create_global_value(ir::GlobalValueData::Load {
-            base: ptr,
+        let bound = func.create_global_value(ir::GlobalValueData::Load {
+            base: base_ptr,
             offset: Offset32::new(current_length_offset),
             global_type: pointer_type,
             flags: MemFlags::trusted(),
         });
 
+        let (base_fact, pcc_memory_type) = self.make_pcc_base_fact_and_type_for_memory(
+            func,
+            memory,
+            base_offset,
+            current_length_offset,
+            ptr_memtype,
+            bound,
+        );
+
+        let base = self.make_heap_base(func, memory, base_ptr, base_offset, base_fact);
+
+        Ok(self.heaps.push(HeapData {
+            base,
+            bound,
+            pcc_memory_type,
+            memory,
+        }))
+    }
+
+    pub(crate) fn make_heap_base(
+        &self,
+        func: &mut Function,
+        memory: Memory,
+        ptr: ir::GlobalValue,
+        offset: i32,
+        fact: Option<Fact>,
+    ) -> ir::GlobalValue {
+        let pointer_type = self.pointer_type();
+
+        let mut flags = ir::MemFlags::trusted().with_checked().with_can_move();
+        if !memory.memory_may_move(self.tunables) {
+            flags.set_readonly();
+        }
+
+        let heap_base = func.create_global_value(ir::GlobalValueData::Load {
+            base: ptr,
+            offset: Offset32::new(offset),
+            global_type: pointer_type,
+            flags,
+        });
+        func.global_value_facts[heap_base] = fact;
+        heap_base
+    }
+
+    pub(crate) fn make_pcc_base_fact_and_type_for_memory(
+        &mut self,
+        func: &mut Function,
+        memory: Memory,
+        base_offset: i32,
+        current_length_offset: i32,
+        ptr_memtype: Option<ir::MemoryType>,
+        heap_bound: ir::GlobalValue,
+    ) -> (Option<Fact>, Option<ir::MemoryType>) {
         // If we have a declared maximum, we can make this a "static" heap, which is
         // allocated up front and never moved.
         let host_page_size_log2 = self.target_config().page_size_align_log2;
@@ -2479,25 +2579,7 @@ impl FuncEnvironment<'_> {
                 (None, None)
             }
         };
-
-        let mut flags = MemFlags::trusted().with_checked().with_can_move();
-        if !memory.memory_may_move(self.tunables) {
-            flags.set_readonly();
-        }
-        let heap_base = func.create_global_value(ir::GlobalValueData::Load {
-            base: ptr,
-            offset: Offset32::new(base_offset),
-            global_type: pointer_type,
-            flags,
-        });
-        func.global_value_facts[heap_base] = base_fact;
-
-        Ok(self.heaps.push(HeapData {
-            base: heap_base,
-            bound: heap_bound,
-            pcc_memory_type: memory_type,
-            memory,
-        }))
+        (base_fact, memory_type)
     }
 
     pub fn make_global(
@@ -3066,15 +3148,11 @@ impl FuncEnvironment<'_> {
         Ok(())
     }
 
-    pub fn before_unconditionally_trapping_memory_access(
-        &mut self,
-        builder: &mut FunctionBuilder,
-    ) -> WasmResult<()> {
+    pub fn before_unconditionally_trapping_memory_access(&mut self, builder: &mut FunctionBuilder) {
         if self.tunables.consume_fuel {
             self.fuel_increment_var(builder);
             self.fuel_save_from_var(builder);
         }
-        Ok(())
     }
 
     pub fn before_translate_function(
@@ -3091,15 +3169,11 @@ impl FuncEnvironment<'_> {
             self.conditionally_trap(builder, overflow, ir::TrapCode::STACK_OVERFLOW);
         }
 
-        // If the `vmstore_context_ptr` variable will get used then we
-        // initialize it here.
-        if self.tunables.consume_fuel || self.tunables.epoch_interruption {
-            self.declare_vmstore_context_ptr(builder);
-        }
         // Additionally we initialize `fuel_var` if it will get used.
         if self.tunables.consume_fuel {
             self.fuel_function_entry(builder);
         }
+
         // Initialize `epoch_var` with the current epoch.
         if self.tunables.epoch_interruption {
             self.epoch_function_entry(builder);
@@ -3143,10 +3217,6 @@ impl FuncEnvironment<'_> {
 
     pub fn use_x86_blendv_for_relaxed_laneselect(&self, ty: Type) -> bool {
         self.isa.has_x86_blendv_lowering(ty)
-    }
-
-    pub fn use_x86_pshufb_for_relaxed_swizzle(&self) -> bool {
-        self.isa.has_x86_pshufb_lowering()
     }
 
     pub fn use_x86_pmulhrsw_for_relaxed_q15mul(&self) -> bool {
@@ -3247,6 +3317,304 @@ impl FuncEnvironment<'_> {
         }
         #[cfg(not(feature = "wmemcheck"))]
         let _ = (builder, num_pages, mem_index);
+    }
+
+    /// If the ISA has rounding instructions, let Cranelift use them. But if
+    /// not, lower to a libcall here, rather than having Cranelift do it. We
+    /// can pass our libcall the vmctx pointer, which we use for stack
+    /// overflow checking.
+    ///
+    /// This helper is generic for all rounding instructions below, both for
+    /// scalar and simd types. The `clif_round` argument is the CLIF-level
+    /// rounding instruction to use if the ISA has the instruction, and the
+    /// `round_builtin` helper is used to determine which element-level
+    /// rounding operation builtin is used. Note that this handles the case
+    /// when `value` is a vector by doing an element-wise libcall invocation.
+    fn isa_round(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        value: ir::Value,
+        clif_round: fn(FuncInstBuilder<'_, '_>, ir::Value) -> ir::Value,
+        round_builtin: fn(&mut BuiltinFunctions, &mut Function) -> ir::FuncRef,
+    ) -> ir::Value {
+        if self.isa.has_round() {
+            return clif_round(builder.ins(), value);
+        }
+
+        let vmctx = self.vmctx_val(&mut builder.cursor());
+        let round = round_builtin(&mut self.builtin_functions, builder.func);
+        let round_one = |builder: &mut FunctionBuilder, value: ir::Value| {
+            let call = builder.ins().call(round, &[vmctx, value]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        };
+
+        let ty = builder.func.dfg.value_type(value);
+        if !ty.is_vector() {
+            return round_one(builder, value);
+        }
+
+        assert_eq!(ty.bits(), 128);
+        let zero = builder.func.dfg.constants.insert(V128Imm([0; 16]).into());
+        let mut result = builder.ins().vconst(ty, zero);
+        for i in 0..u8::try_from(ty.lane_count()).unwrap() {
+            let element = builder.ins().extractlane(value, i);
+            let element_rounded = round_one(builder, element);
+            result = builder.ins().insertlane(result, element_rounded, i);
+        }
+        result
+    }
+
+    pub fn ceil_f32(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.ceil(val),
+            BuiltinFunctions::ceil_f32,
+        )
+    }
+
+    pub fn ceil_f64(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.ceil(val),
+            BuiltinFunctions::ceil_f64,
+        )
+    }
+
+    pub fn ceil_f32x4(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.ceil(val),
+            BuiltinFunctions::ceil_f32,
+        )
+    }
+
+    pub fn ceil_f64x2(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.ceil(val),
+            BuiltinFunctions::ceil_f64,
+        )
+    }
+
+    pub fn floor_f32(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.floor(val),
+            BuiltinFunctions::floor_f32,
+        )
+    }
+
+    pub fn floor_f64(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.floor(val),
+            BuiltinFunctions::floor_f64,
+        )
+    }
+
+    pub fn floor_f32x4(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.floor(val),
+            BuiltinFunctions::floor_f32,
+        )
+    }
+
+    pub fn floor_f64x2(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.floor(val),
+            BuiltinFunctions::floor_f64,
+        )
+    }
+
+    pub fn trunc_f32(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.trunc(val),
+            BuiltinFunctions::trunc_f32,
+        )
+    }
+
+    pub fn trunc_f64(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.trunc(val),
+            BuiltinFunctions::trunc_f64,
+        )
+    }
+
+    pub fn trunc_f32x4(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.trunc(val),
+            BuiltinFunctions::trunc_f32,
+        )
+    }
+
+    pub fn trunc_f64x2(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.trunc(val),
+            BuiltinFunctions::trunc_f64,
+        )
+    }
+
+    pub fn nearest_f32(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.nearest(val),
+            BuiltinFunctions::nearest_f32,
+        )
+    }
+
+    pub fn nearest_f64(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.nearest(val),
+            BuiltinFunctions::nearest_f64,
+        )
+    }
+
+    pub fn nearest_f32x4(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.nearest(val),
+            BuiltinFunctions::nearest_f32,
+        )
+    }
+
+    pub fn nearest_f64x2(&mut self, builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+        self.isa_round(
+            builder,
+            value,
+            |ins, val| ins.nearest(val),
+            BuiltinFunctions::nearest_f64,
+        )
+    }
+
+    pub fn swizzle(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        a: ir::Value,
+        b: ir::Value,
+    ) -> ir::Value {
+        // On x86, swizzle would typically be compiled to `pshufb`, except
+        // that that's not available on CPUs that lack SSSE3. In that case,
+        // fall back to a builtin function.
+        if !self.is_x86() || self.isa.has_x86_pshufb_lowering() {
+            builder.ins().swizzle(a, b)
+        } else {
+            let swizzle = self.builtin_functions.i8x16_swizzle(builder.func);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            let call = builder.ins().call(swizzle, &[vmctx, a, b]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        }
+    }
+
+    pub fn relaxed_swizzle(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        a: ir::Value,
+        b: ir::Value,
+    ) -> ir::Value {
+        // As above, fall back to a builtin if we lack SSSE3.
+        if !self.is_x86() || self.isa.has_x86_pshufb_lowering() {
+            if !self.is_x86() || self.relaxed_simd_deterministic() {
+                builder.ins().swizzle(a, b)
+            } else {
+                builder.ins().x86_pshufb(a, b)
+            }
+        } else {
+            let swizzle = self.builtin_functions.i8x16_swizzle(builder.func);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            let call = builder.ins().call(swizzle, &[vmctx, a, b]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        }
+    }
+
+    pub fn i8x16_shuffle(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        a: ir::Value,
+        b: ir::Value,
+        lanes: &[u8; 16],
+    ) -> ir::Value {
+        // As with swizzle, i8x16.shuffle would also commonly be implemented
+        // with pshufb, so if we lack SSSE3, fall back to a builtin.
+        if !self.is_x86() || self.isa.has_x86_pshufb_lowering() {
+            let lanes = ConstantData::from(&lanes[..]);
+            let mask = builder.func.dfg.immediates.push(lanes);
+            builder.ins().shuffle(a, b, mask)
+        } else {
+            let lanes = builder
+                .func
+                .dfg
+                .constants
+                .insert(ConstantData::from(&lanes[..]));
+            let lanes = builder.ins().vconst(I8X16, lanes);
+            let i8x16_shuffle = self.builtin_functions.i8x16_shuffle(builder.func);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            let call = builder.ins().call(i8x16_shuffle, &[vmctx, a, b, lanes]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        }
+    }
+
+    pub fn fma_f32x4(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        a: ir::Value,
+        b: ir::Value,
+        c: ir::Value,
+    ) -> ir::Value {
+        if self.has_native_fma() {
+            builder.ins().fma(a, b, c)
+        } else if self.relaxed_simd_deterministic() {
+            // Deterministic semantics are "fused multiply and add".
+            let fma = self.builtin_functions.fma_f32x4(builder.func);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            let call = builder.ins().call(fma, &[vmctx, a, b, c]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        } else {
+            let mul = builder.ins().fmul(a, b);
+            builder.ins().fadd(mul, c)
+        }
+    }
+
+    pub fn fma_f64x2(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        a: ir::Value,
+        b: ir::Value,
+        c: ir::Value,
+    ) -> ir::Value {
+        if self.has_native_fma() {
+            builder.ins().fma(a, b, c)
+        } else if self.relaxed_simd_deterministic() {
+            // Deterministic semantics are "fused multiply and add".
+            let fma = self.builtin_functions.fma_f64x2(builder.func);
+            let vmctx = self.vmctx_val(&mut builder.cursor());
+            let call = builder.ins().call(fma, &[vmctx, a, b, c]);
+            *builder.func.dfg.inst_results(call).first().unwrap()
+        } else {
+            let mul = builder.ins().fmul(a, b);
+            builder.ins().fadd(mul, c)
+        }
     }
 
     pub fn isa(&self) -> &dyn TargetIsa {

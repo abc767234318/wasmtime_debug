@@ -3,16 +3,16 @@
 //! The `Function` struct defined in this module owns all of its basic blocks and
 //! instructions.
 
+use crate::HashMap;
 use crate::entity::{PrimaryMap, SecondaryMap};
 use crate::ir::{
-    self, pcc::Fact, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData,
-    DynamicStackSlots, DynamicType, ExtFuncData, FuncRef, GlobalValue, GlobalValueData, Inst,
-    JumpTable, JumpTableData, Layout, MemoryType, MemoryTypeData, SigRef, Signature, SourceLocs,
-    StackSlot, StackSlotData, StackSlots, Type,
+    self, Block, DataFlowGraph, DynamicStackSlot, DynamicStackSlotData, DynamicStackSlots,
+    DynamicType, ExtFuncData, FuncRef, GlobalValue, GlobalValueData, Inst, JumpTable,
+    JumpTableData, Layout, MemoryType, MemoryTypeData, SigRef, Signature, SourceLocs, StackSlot,
+    StackSlotData, StackSlots, Type, pcc::Fact,
 };
 use crate::isa::CallConv;
-use crate::write::write_function;
-use crate::HashMap;
+use crate::write::{write_function, write_function_spec};
 #[cfg(feature = "enable-serde")]
 use alloc::string::String;
 use core::fmt;
@@ -282,7 +282,9 @@ impl FunctionStencil {
     /// Rewrite the branch destination to `new_dest` if the destination matches `old_dest`.
     /// Does nothing if called with a non-jump or non-branch instruction.
     pub fn rewrite_branch_destination(&mut self, inst: Inst, old_dest: Block, new_dest: Block) {
-        for dest in self.dfg.insts[inst].branch_destination_mut(&mut self.dfg.jump_tables) {
+        for dest in self.dfg.insts[inst]
+            .branch_destination_mut(&mut self.dfg.jump_tables, &mut self.dfg.exception_tables)
+        {
             if dest.block(&self.dfg.value_lists) == old_dest {
                 dest.set_block(new_dest, &mut self.dfg.value_lists)
             }
@@ -312,7 +314,7 @@ impl FunctionStencil {
     pub fn block_successors(&self, block: Block) -> impl DoubleEndedIterator<Item = Block> + '_ {
         self.layout.last_inst(block).into_iter().flat_map(|inst| {
             self.dfg.insts[inst]
-                .branch_destination(&self.dfg.jump_tables)
+                .branch_destination(&self.dfg.jump_tables, &self.dfg.exception_tables)
                 .iter()
                 .map(|block| block.block(&self.dfg.value_lists))
         })
@@ -349,12 +351,13 @@ impl FunctionStencil {
             self.dfg.inst_results(dst).len(),
             self.dfg.inst_results(src).len()
         );
-        debug_assert!(self
-            .dfg
-            .inst_results(dst)
-            .iter()
-            .zip(self.dfg.inst_results(src))
-            .all(|(a, b)| self.dfg.value_type(*a) == self.dfg.value_type(*b)));
+        debug_assert!(
+            self.dfg
+                .inst_results(dst)
+                .iter()
+                .zip(self.dfg.inst_results(src))
+                .all(|(a, b)| self.dfg.value_type(*a) == self.dfg.value_type(*b))
+        );
 
         self.dfg.insts[dst] = self.dfg.insts[src];
         self.layout.remove_inst(src);
@@ -445,6 +448,11 @@ impl Function {
         DisplayFunction(self)
     }
 
+    /// Return an object that can display this function's name and signature.
+    pub fn display_spec(&self) -> DisplayFunctionSpec<'_> {
+        DisplayFunctionSpec(self)
+    }
+
     /// Sets an absolute source location for the given instruction.
     ///
     /// If no base source location has been set yet, records it at the same time.
@@ -491,5 +499,20 @@ impl fmt::Display for Function {
 impl fmt::Debug for Function {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write_function(fmt, self)
+    }
+}
+
+/// Wrapper type capable of displaying a 'Function's name and signature.
+pub struct DisplayFunctionSpec<'a>(&'a Function);
+
+impl<'a> fmt::Display for DisplayFunctionSpec<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write_function_spec(fmt, self.0)
+    }
+}
+
+impl<'a> fmt::Debug for DisplayFunctionSpec<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write_function_spec(fmt, self.0)
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     EngineOrModuleTypeIndex, EntityType, ModuleInternedTypeIndex, ModuleTypes, ModuleTypesBuilder,
     PrimaryMap, TypeConvert, WasmHeapType, WasmValType,
 };
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use cranelift_entity::EntityRef;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -382,7 +382,7 @@ impl ComponentTypesBuilder {
             }),
             Table(ty) => EntityType::Table(self.convert_table_type(ty)?),
             Memory(ty) => EntityType::Memory((*ty).into()),
-            Global(ty) => EntityType::Global(self.convert_global_type(ty)),
+            Global(ty) => EntityType::Global(self.convert_global_type(ty)?),
             Tag(_) => bail!("exceptions proposal not implemented"),
         })
     }
@@ -417,6 +417,9 @@ impl ComponentTypesBuilder {
             }
             ComponentDefinedType::Stream(ty) => {
                 InterfaceType::Stream(self.stream_table_type(types, ty)?)
+            }
+            ComponentDefinedType::FixedSizeList(..) => {
+                bail!("support not implemented for fixed-size-lists");
             }
         };
         let info = self.type_information(&ret);

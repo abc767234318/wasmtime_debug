@@ -85,14 +85,11 @@ impl Table {
     /// This function will panic when used with a non-async
     /// [`Store`](`crate::Store`)
     #[cfg(feature = "async")]
-    pub async fn new_async<T>(
-        mut store: impl AsContextMut<Data = T>,
+    pub async fn new_async(
+        mut store: impl AsContextMut<Data: Send>,
         ty: TableType,
         init: Ref,
-    ) -> Result<Table>
-    where
-        T: Send,
-    {
+    ) -> Result<Table> {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
@@ -109,7 +106,7 @@ impl Table {
         unsafe {
             let table = Table::from_wasmtime_table(wasmtime_export, store);
             let wasmtime_table = table.wasmtime_table(store, iter::empty());
-            (*wasmtime_table).fill(store.optional_gc_store_mut()?, 0, init, ty.minimum())?;
+            (*wasmtime_table).fill(store.optional_gc_store_mut(), 0, init, ty.minimum())?;
             Ok(table)
         }
     }
@@ -155,7 +152,7 @@ impl Table {
     pub fn get(&self, mut store: impl AsContextMut, index: u64) -> Option<Ref> {
         let mut store = AutoAssertNoGc::new(store.as_context_mut().0);
         let table = self.wasmtime_table(&mut store, iter::once(index));
-        let gc_store = store.optional_gc_store_mut().ok().and_then(|s| s);
+        let gc_store = store.optional_gc_store_mut();
         unsafe {
             match (*table).get(gc_store, index)? {
                 runtime::TableElement::FuncRef(f) => {
@@ -278,15 +275,12 @@ impl Table {
     /// This function will panic when used with a non-async
     /// [`Store`](`crate::Store`).
     #[cfg(feature = "async")]
-    pub async fn grow_async<T>(
+    pub async fn grow_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         delta: u64,
         init: Ref,
-    ) -> Result<u64>
-    where
-        T: Send,
-    {
+    ) -> Result<u64> {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
@@ -334,7 +328,7 @@ impl Table {
         let src_table = src_table.wasmtime_table(store, src_range);
         unsafe {
             runtime::Table::copy(
-                store.optional_gc_store_mut()?,
+                store.optional_gc_store_mut(),
                 dst_table,
                 src_table,
                 dst_index,
@@ -368,7 +362,7 @@ impl Table {
 
         let table = self.wasmtime_table(store, iter::empty());
         unsafe {
-            (*table).fill(store.optional_gc_store_mut()?, dst, val, len)?;
+            (*table).fill(store.optional_gc_store_mut(), dst, val, len)?;
         }
 
         Ok(())
@@ -402,10 +396,12 @@ impl Table {
         wasmtime_export: crate::runtime::vm::ExportTable,
         store: &mut StoreOpaque,
     ) -> Table {
-        debug_assert!(wasmtime_export
-            .table
-            .ref_type
-            .is_canonicalized_for_runtime_usage());
+        debug_assert!(
+            wasmtime_export
+                .table
+                .ref_type
+                .is_canonicalized_for_runtime_usage()
+        );
 
         Table(store.store_data_mut().insert(wasmtime_export))
     }
@@ -414,9 +410,9 @@ impl Table {
         &data[self.0].table
     }
 
-    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMTableImport {
+    pub(crate) fn vmimport(&self, store: &StoreOpaque) -> crate::runtime::vm::VMTable {
         let export = &store[self.0];
-        crate::runtime::vm::VMTableImport {
+        crate::runtime::vm::VMTable {
             from: export.definition.into(),
             vmctx: export.vmctx.into(),
         }

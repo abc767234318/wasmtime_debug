@@ -46,7 +46,7 @@
 
 use crate::binemit::{Addend, CodeInfo, CodeOffset, Reloc};
 use crate::ir::{
-    self, function::FunctionParameters, DynamicStackSlot, RelSourceLoc, StackSlot, Type,
+    self, DynamicStackSlot, RelSourceLoc, StackSlot, Type, function::FunctionParameters,
 };
 use crate::isa::FunctionAlignment;
 use crate::result::CodegenResult;
@@ -58,7 +58,7 @@ use core::fmt::Debug;
 use cranelift_control::ControlPlane;
 use cranelift_entity::PrimaryMap;
 use regalloc2::VReg;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::string::String;
 
 #[cfg(feature = "enable-serde")]
@@ -112,7 +112,8 @@ pub trait MachInst: Clone + Debug {
     /// Is this an "args" pseudoinst?
     fn is_args(&self) -> bool;
 
-    /// Should this instruction be included in the clobber-set?
+    /// Should this instruction's clobber-list be included in the
+    /// clobber-set?
     fn is_included_in_clobbers(&self) -> bool;
 
     /// Does this instruction access memory?
@@ -267,8 +268,7 @@ pub trait MachInstLabelUse: Clone + Copy + Debug + Eq {
     fn from_reloc(reloc: Reloc, addend: Addend) -> Option<Self>;
 }
 
-/// Describes a block terminator (not call) in the vcode, when its branches
-/// have not yet been finalized (so a branch may have two targets).
+/// Describes a block terminator (not call) in the VCode.
 ///
 /// Actual targets are not included: the single-source-of-truth for
 /// those is the VCode itself, which holds, for each block, successors
@@ -281,12 +281,8 @@ pub enum MachTerminator {
     Ret,
     /// A tail call.
     RetCall,
-    /// An unconditional branch to another block.
-    Uncond,
-    /// A conditional branch to one of two other blocks.
-    Cond,
-    /// An indirect branch with known possible targets.
-    Indirect,
+    /// A branch.
+    Branch,
 }
 
 /// A trait describing the ability to encode a MachInst into binary machine code.

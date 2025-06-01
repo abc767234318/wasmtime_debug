@@ -8,7 +8,7 @@ fn serialize(engine: &Engine, wat: &str) -> Result<Vec<u8>> {
 }
 
 unsafe fn deserialize_and_instantiate(store: &mut Store<()>, buffer: &[u8]) -> Result<Instance> {
-    let module = Module::deserialize(store.engine(), buffer)?;
+    let module = unsafe { Module::deserialize(store.engine(), buffer)? };
     Ok(Instance::new(store, &module, &[])?)
 }
 
@@ -24,9 +24,10 @@ fn test_version_mismatch() -> Result<()> {
     let custom_version_engine = Engine::new(&config).unwrap();
     match unsafe { Module::deserialize(&custom_version_engine, &buffer) } {
         Ok(_) => bail!("expected deserialization to fail"),
-        Err(e) => assert!(e
-            .to_string()
-            .starts_with("Module was compiled with incompatible version")),
+        Err(e) => assert!(
+            e.to_string()
+                .starts_with("Module was compiled with incompatible version")
+        ),
     }
 
     let mut config = Config::new();

@@ -7,8 +7,12 @@ use std::os::raw::c_char;
 use std::ptr;
 use std::{ffi::CStr, sync::Arc};
 use wasmtime::{
-    Config, LinearMemory, MemoryCreator, OptLevel, ProfilingStrategy, Result, Strategy,
+    Config, InstanceAllocationStrategy, LinearMemory, MemoryCreator, OptLevel, ProfilingStrategy,
+    Result, Strategy,
 };
+
+#[cfg(feature = "pooling-allocator")]
+use wasmtime::PoolingAllocationConfig;
 
 #[repr(C)]
 #[derive(Clone)]
@@ -207,12 +211,18 @@ pub unsafe extern "C" fn wasmtime_config_cache_config_load(
     c: &mut wasm_config_t,
     filename: *const c_char,
 ) -> Option<Box<wasmtime_error_t>> {
+    use std::path::Path;
+
+    use wasmtime::Cache;
+
     handle_result(
         if filename.is_null() {
-            c.config.cache_config_load_default()
+            Cache::from_file(None).map(|cache| c.config.cache(Some(cache)))
         } else {
             match CStr::from_ptr(filename).to_str() {
-                Ok(s) => c.config.cache_config_load(s),
+                Ok(s) => {
+                    Cache::from_file(Some(&Path::new(s))).map(|cache| c.config.cache(Some(cache)))
+                }
                 Err(e) => Err(e.into()),
             }
         },
@@ -443,4 +453,217 @@ pub extern "C" fn wasmtime_config_memory_init_cow_set(c: &mut wasm_config_t, ena
 #[unsafe(no_mangle)]
 pub extern "C" fn wasmtime_config_wasm_wide_arithmetic_set(c: &mut wasm_config_t, enable: bool) {
     c.config.wasm_wide_arithmetic(enable);
+}
+
+#[repr(C)]
+#[derive(Clone)]
+#[cfg(feature = "pooling-allocator")]
+pub struct wasmtime_pooling_allocation_config_t {
+    pub(crate) config: PoolingAllocationConfig,
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_new()
+-> Box<wasmtime_pooling_allocation_config_t> {
+    Box::new(wasmtime_pooling_allocation_config_t {
+        config: PoolingAllocationConfig::default(),
+    })
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_delete(
+    _: Box<wasmtime_pooling_allocation_config_t>,
+) {
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_unused_warm_slots_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    max: u32,
+) {
+    c.config.max_unused_warm_slots(max);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_decommit_batch_size_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    batch_size: usize,
+) {
+    c.config.decommit_batch_size(batch_size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "pooling-allocator", feature = "async"))]
+pub extern "C" fn wasmtime_pooling_allocation_config_async_stack_keep_resident_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    size: usize,
+) {
+    c.config.async_stack_keep_resident(size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_linear_memory_keep_resident_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    size: usize,
+) {
+    c.config.linear_memory_keep_resident(size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_table_keep_resident_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    size: usize,
+) {
+    c.config.table_keep_resident(size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_component_instances_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_component_instances(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_component_instance_size_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    size: usize,
+) {
+    c.config.max_component_instance_size(size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_core_instances_per_component_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.max_core_instances_per_component(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_memories_per_component_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.max_memories_per_component(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_tables_per_component_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.max_tables_per_component(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_memories_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_memories(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_tables_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_tables(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "pooling-allocator", feature = "async"))]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_stacks_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_stacks(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_core_instances_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_core_instances(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_core_instance_size_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    size: usize,
+) {
+    c.config.max_core_instance_size(size);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_tables_per_module_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    tables: u32,
+) {
+    c.config.max_tables_per_module(tables);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_table_elements_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    elements: usize,
+) {
+    c.config.table_elements(elements);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_memories_per_module_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    memories: u32,
+) {
+    c.config.max_memories_per_module(memories);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_config_max_memory_size_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    bytes: usize,
+) {
+    c.config.max_memory_size(bytes);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "pooling-allocator", feature = "gc"))]
+pub extern "C" fn wasmtime_pooling_allocation_config_total_gc_heaps_set(
+    c: &mut wasmtime_pooling_allocation_config_t,
+    count: u32,
+) {
+    c.config.total_gc_heaps(count);
+}
+
+#[unsafe(no_mangle)]
+#[cfg(feature = "pooling-allocator")]
+pub extern "C" fn wasmtime_pooling_allocation_strategy_set(
+    c: &mut wasm_config_t,
+    pc: &wasmtime_pooling_allocation_config_t,
+) {
+    c.config
+        .allocation_strategy(InstanceAllocationStrategy::Pooling(pc.config.clone()));
 }

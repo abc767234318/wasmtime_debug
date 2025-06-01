@@ -1,13 +1,13 @@
+use crate::MemoryType;
 use crate::memory::{LinearMemory, MemoryCreator};
 use crate::prelude::*;
 use crate::runtime::vm::mpk::ProtectionKey;
 use crate::runtime::vm::{
-    CompiledModuleId, Imports, InstanceAllocationRequest, InstanceAllocator, InstanceAllocatorImpl,
-    Memory, MemoryAllocationIndex, MemoryBase, ModuleRuntimeInfo, OnDemandInstanceAllocator,
-    RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory, StorePtr, Table, TableAllocationIndex,
+    CompiledModuleId, InstanceAllocationRequest, InstanceAllocatorImpl, Memory,
+    MemoryAllocationIndex, MemoryBase, ModuleRuntimeInfo, OnDemandInstanceAllocator,
+    RuntimeLinearMemory, RuntimeMemoryCreator, SharedMemory, Table, TableAllocationIndex,
 };
-use crate::store::{InstanceId, StoreOpaque};
-use crate::MemoryType;
+use crate::store::{AllocateInstanceKind, InstanceId, StoreOpaque};
 use alloc::sync::Arc;
 use wasmtime_environ::{
     DefinedMemoryIndex, DefinedTableIndex, EntityIndex, HostPtr, Module, Tunables, VMOffsets,
@@ -15,8 +15,8 @@ use wasmtime_environ::{
 
 #[cfg(feature = "component-model")]
 use wasmtime_environ::{
-    component::{Component, VMComponentOffsets},
     StaticModuleIndex,
+    component::{Component, VMComponentOffsets},
 };
 
 /// Create a "frankenstein" instance with a single memory.
@@ -47,27 +47,19 @@ pub fn create_memory(
     // associated with external objects. The configured instance allocator
     // should only be used when creating module instances as we don't want host
     // objects to count towards instance limits.
-    let runtime_info = &ModuleRuntimeInfo::bare_maybe_imported_func(Arc::new(module), None);
-    let host_state = Box::new(());
-    let imports = Imports::default();
-    let request = InstanceAllocationRequest {
-        imports,
-        host_state,
-        store: StorePtr::new(store.traitobj()),
-        runtime_info,
-        wmemcheck: false,
-        pkey: None,
-        tunables: store.engine().tunables(),
+    let allocator = SingleMemoryInstance {
+        preallocation,
+        ondemand: OnDemandInstanceAllocator::default(),
     };
-
     unsafe {
-        let handle = SingleMemoryInstance {
-            preallocation,
-            ondemand: OnDemandInstanceAllocator::default(),
-        }
-        .allocate_module(request)?;
-        let instance_id = store.add_dummy_instance(handle.clone());
-        Ok(instance_id)
+        store.allocate_instance(
+            AllocateInstanceKind::Dummy {
+                allocator: &allocator,
+            },
+            &ModuleRuntimeInfo::bare_maybe_imported_func(Arc::new(module), None),
+            Default::default(),
+            Box::new(()),
+        )
     }
 }
 
@@ -143,6 +135,11 @@ unsafe impl InstanceAllocatorImpl for SingleMemoryInstance<'_> {
         Ok(())
     }
 
+    #[cfg(feature = "gc")]
+    fn validate_memory_impl(&self, memory: &wasmtime_environ::Memory) -> Result<()> {
+        self.ondemand.validate_memory_impl(memory)
+    }
+
     fn increment_component_instance_count(&self) -> Result<()> {
         self.ondemand.increment_component_instance_count()
     }
@@ -164,7 +161,7 @@ unsafe impl InstanceAllocatorImpl for SingleMemoryInstance<'_> {
         request: &mut InstanceAllocationRequest,
         ty: &wasmtime_environ::Memory,
         tunables: &Tunables,
-        memory_index: DefinedMemoryIndex,
+        memory_index: Option<DefinedMemoryIndex>,
     ) -> Result<(MemoryAllocationIndex, Memory)> {
         #[cfg(debug_assertions)]
         {
@@ -187,7 +184,7 @@ unsafe impl InstanceAllocatorImpl for SingleMemoryInstance<'_> {
 
     unsafe fn deallocate_memory(
         &self,
-        memory_index: DefinedMemoryIndex,
+        memory_index: Option<DefinedMemoryIndex>,
         allocation_index: MemoryAllocationIndex,
         memory: Memory,
     ) {
@@ -245,20 +242,19 @@ unsafe impl InstanceAllocatorImpl for SingleMemoryInstance<'_> {
     fn allocate_gc_heap(
         &self,
         _engine: &crate::Engine,
-        _gc_runtime: &dyn crate::runtime::vm::GcRuntime,
-    ) -> Result<(
-        crate::runtime::vm::GcHeapAllocationIndex,
-        Box<dyn crate::runtime::vm::GcHeap>,
-    )> {
+        _gc_runtime: &dyn crate::vm::GcRuntime,
+        _memory_alloc_index: crate::vm::MemoryAllocationIndex,
+        _memory: Memory,
+    ) -> Result<(crate::vm::GcHeapAllocationIndex, Box<dyn crate::vm::GcHeap>)> {
         unreachable!()
     }
 
     #[cfg(feature = "gc")]
     fn deallocate_gc_heap(
         &self,
-        _allocation_index: crate::runtime::vm::GcHeapAllocationIndex,
-        _gc_heap: Box<dyn crate::runtime::vm::GcHeap>,
-    ) {
+        _allocation_index: crate::vm::GcHeapAllocationIndex,
+        _gc_heap: Box<dyn crate::vm::GcHeap>,
+    ) -> (crate::vm::MemoryAllocationIndex, crate::vm::Memory) {
         unreachable!()
     }
 }

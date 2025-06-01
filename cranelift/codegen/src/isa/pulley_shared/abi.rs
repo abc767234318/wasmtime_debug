@@ -1,26 +1,24 @@
 //! Implementation of a standard Pulley ABI.
 
-use super::{inst::*, PulleyFlags, PulleyTargetKind};
-use crate::isa::pulley_shared::{PointerWidth, PulleyBackend};
+use super::{PulleyFlags, PulleyTargetKind, inst::*};
+use crate::isa::pulley_shared::PointerWidth;
 use crate::{
-    ir::{self, types::*, MemFlags, Signature},
+    CodegenResult,
+    ir::{self, MemFlags, Signature, types::*},
     isa,
     machinst::*,
-    settings, CodegenResult,
+    settings,
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 use cranelift_bitset::ScalarBitSet;
 use regalloc2::{MachineEnv, PReg, PRegSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::borrow::ToOwned;
 use std::sync::OnceLock;
 
 /// Support for the Pulley ABI from the callee side (within a function body).
 pub(crate) type PulleyCallee<P> = Callee<PulleyMachineDeps<P>>;
-
-/// Support for the Pulley ABI from the caller side (at a callsite).
-pub(crate) type PulleyABICallSite<P> = CallSite<PulleyMachineDeps<P>>;
 
 /// Pulley-specific ABI behavior. This struct just serves as an implementation
 /// point for the trait; it is never actually instantiated.
@@ -405,14 +403,14 @@ where
     }
 
     fn gen_return(
-        _call_conv: isa::CallConv,
+        call_conv: isa::CallConv,
         _isa_flags: &PulleyFlags,
         frame_layout: &FrameLayout,
     ) -> SmallInstVec<Self::I> {
         let mut insts = SmallVec::new();
 
         // Handle final stack adjustments for the tail-call ABI.
-        if frame_layout.tail_args_size > 0 {
+        if call_conv == isa::CallConv::Tail && frame_layout.tail_args_size > 0 {
             insts.extend(Self::gen_sp_reg_adjust(
                 frame_layout.tail_args_size.try_into().unwrap(),
             ));
@@ -444,57 +442,6 @@ where
     ) -> SmallVec<[Self::I; 16]> {
         // Intentionally empty as restores happen for Pulley in `gen_return`.
         SmallVec::new()
-    }
-
-    fn gen_call(
-        dest: &CallDest,
-        _tmp: Writable<Reg>,
-        mut info: CallInfo<()>,
-    ) -> SmallVec<[Self::I; 2]> {
-        match dest {
-            // "near" calls are pulley->pulley calls so they use a normal "call"
-            // opcode
-            CallDest::ExtName(name, RelocDistance::Near) => {
-                // The first four integer arguments to a call can be handled via
-                // special pulley call instructions. Assert here that
-                // `info.uses` is sorted in order and then take out x0-x3 if
-                // they're present and move them from `info.uses` to
-                // `info.dest.args` to be handled differently during register
-                // allocation.
-                let mut args = SmallVec::new();
-                info.uses.sort_by_key(|arg| arg.preg);
-                info.uses.retain(|arg| {
-                    if arg.preg != x0() && arg.preg != x1() && arg.preg != x2() && arg.preg != x3()
-                    {
-                        return true;
-                    }
-                    args.push(XReg::new(arg.vreg).unwrap());
-                    false
-                });
-                smallvec![Inst::Call {
-                    info: Box::new(info.map(|()| PulleyCall {
-                        name: name.clone(),
-                        args,
-                    }))
-                }
-                .into()]
-            }
-            // "far" calls are pulley->host calls so they use a different opcode
-            // which is lowered with a special relocation in the backend.
-            CallDest::ExtName(name, RelocDistance::Far) => {
-                smallvec![Inst::IndirectCallHost {
-                    info: Box::new(info.map(|()| name.clone()))
-                }
-                .into()]
-            }
-            // Indirect calls are all assumed to be pulley->pulley calls
-            CallDest::Reg(reg) => {
-                smallvec![Inst::IndirectCall {
-                    info: Box::new(info.map(|()| XReg::new(*reg).unwrap()))
-                }
-                .into()]
-            }
-        }
     }
 
     fn gen_memcpy<F: FnMut(Type) -> Writable<Reg>>(
@@ -532,8 +479,15 @@ where
         MACHINE_ENV.get_or_init(create_reg_environment)
     }
 
-    fn get_regs_clobbered_by_call(_call_conv_of_callee: isa::CallConv) -> PRegSet {
-        DEFAULT_CLOBBERS
+    fn get_regs_clobbered_by_call(
+        _call_conv_of_callee: isa::CallConv,
+        is_exception: bool,
+    ) -> PRegSet {
+        if is_exception {
+            ALL_CLOBBERS
+        } else {
+            DEFAULT_CLOBBERS
+        }
     }
 
     fn compute_frame_layout(
@@ -544,6 +498,7 @@ where
         is_leaf: bool,
         incoming_args_size: u32,
         tail_args_size: u32,
+        stackslots_size: u32,
         fixed_frame_storage_size: u32,
         outgoing_args_size: u32,
     ) -> FrameLayout {
@@ -578,6 +533,7 @@ where
             setup_area_size: setup_area_size.into(),
             clobber_size,
             fixed_frame_storage_size,
+            stackslots_size,
             outgoing_args_size,
             clobbered_callee_saves: regs,
         }
@@ -591,6 +547,20 @@ where
     ) {
         // Pulley doesn't need inline probestacks because it always checks stack
         // decrements.
+    }
+
+    fn retval_temp_reg(_call_conv_of_callee: isa::CallConv) -> Writable<Reg> {
+        // Use x15 as a temp if needed: clobbered, not a
+        // retval.
+        Writable::from_reg(regs::x_reg(15))
+    }
+
+    fn exception_payload_regs(_call_conv: isa::CallConv) -> &'static [Reg] {
+        const PAYLOAD_REGS: &'static [Reg] = &[
+            Reg::from_real_reg(regs::px_reg(0)),
+            Reg::from_real_reg(regs::px_reg(1)),
+        ];
+        PAYLOAD_REGS
     }
 }
 
@@ -756,53 +726,6 @@ impl FrameLayout {
     }
 }
 
-impl<P> PulleyABICallSite<P>
-where
-    P: PulleyTargetKind,
-{
-    pub fn emit_return_call(
-        mut self,
-        ctx: &mut Lower<InstAndKind<P>>,
-        args: isle::ValueSlice,
-        _backend: &PulleyBackend<P>,
-    ) {
-        let new_stack_arg_size =
-            u32::try_from(self.sig(ctx.sigs()).sized_stack_arg_space()).unwrap();
-
-        ctx.abi_mut().accumulate_tail_args_size(new_stack_arg_size);
-
-        // Put all arguments in registers and stack slots (within that newly
-        // allocated stack space).
-        self.emit_args(ctx, args);
-        self.emit_stack_ret_arg_for_tail_call(ctx);
-
-        let dest = self.dest().clone();
-        let uses = self.take_uses();
-
-        match dest {
-            CallDest::ExtName(name, RelocDistance::Near) => {
-                let info = Box::new(ReturnCallInfo {
-                    dest: name,
-                    uses,
-                    new_stack_arg_size,
-                });
-                ctx.emit(Inst::ReturnCall { info }.into());
-            }
-            CallDest::ExtName(_name, RelocDistance::Far) => {
-                unimplemented!("return-call of a host function")
-            }
-            CallDest::Reg(callee) => {
-                let info = Box::new(ReturnCallInfo {
-                    dest: XReg::new(callee).unwrap(),
-                    uses,
-                    new_stack_arg_size,
-                });
-                ctx.emit(Inst::ReturnIndirectCall { info }.into());
-            }
-        }
-    }
-}
-
 const DEFAULT_CALLEE_SAVES: PRegSet = PRegSet::empty()
     // Integer registers.
     .with(px_reg(16))
@@ -893,6 +816,104 @@ const DEFAULT_CLOBBERS: PRegSet = PRegSet::empty()
     .with(pf_reg(14))
     .with(pf_reg(15))
     // All vector registers get clobbered.
+    .with(pv_reg(0))
+    .with(pv_reg(1))
+    .with(pv_reg(2))
+    .with(pv_reg(3))
+    .with(pv_reg(4))
+    .with(pv_reg(5))
+    .with(pv_reg(6))
+    .with(pv_reg(7))
+    .with(pv_reg(8))
+    .with(pv_reg(9))
+    .with(pv_reg(10))
+    .with(pv_reg(11))
+    .with(pv_reg(12))
+    .with(pv_reg(13))
+    .with(pv_reg(14))
+    .with(pv_reg(15))
+    .with(pv_reg(16))
+    .with(pv_reg(17))
+    .with(pv_reg(18))
+    .with(pv_reg(19))
+    .with(pv_reg(20))
+    .with(pv_reg(21))
+    .with(pv_reg(22))
+    .with(pv_reg(23))
+    .with(pv_reg(24))
+    .with(pv_reg(25))
+    .with(pv_reg(26))
+    .with(pv_reg(27))
+    .with(pv_reg(28))
+    .with(pv_reg(29))
+    .with(pv_reg(30))
+    .with(pv_reg(31));
+
+const ALL_CLOBBERS: PRegSet = PRegSet::empty()
+    .with(px_reg(0))
+    .with(px_reg(1))
+    .with(px_reg(2))
+    .with(px_reg(3))
+    .with(px_reg(4))
+    .with(px_reg(5))
+    .with(px_reg(6))
+    .with(px_reg(7))
+    .with(px_reg(8))
+    .with(px_reg(9))
+    .with(px_reg(10))
+    .with(px_reg(11))
+    .with(px_reg(12))
+    .with(px_reg(13))
+    .with(px_reg(14))
+    .with(px_reg(15))
+    .with(px_reg(16))
+    .with(px_reg(17))
+    .with(px_reg(18))
+    .with(px_reg(19))
+    .with(px_reg(20))
+    .with(px_reg(21))
+    .with(px_reg(22))
+    .with(px_reg(23))
+    .with(px_reg(24))
+    .with(px_reg(25))
+    .with(px_reg(26))
+    .with(px_reg(27))
+    .with(px_reg(28))
+    .with(px_reg(29))
+    .with(px_reg(30))
+    .with(px_reg(31))
+    .with(pf_reg(0))
+    .with(pf_reg(1))
+    .with(pf_reg(2))
+    .with(pf_reg(3))
+    .with(pf_reg(4))
+    .with(pf_reg(5))
+    .with(pf_reg(6))
+    .with(pf_reg(7))
+    .with(pf_reg(8))
+    .with(pf_reg(9))
+    .with(pf_reg(10))
+    .with(pf_reg(11))
+    .with(pf_reg(12))
+    .with(pf_reg(13))
+    .with(pf_reg(14))
+    .with(pf_reg(15))
+    .with(pf_reg(16))
+    .with(pf_reg(17))
+    .with(pf_reg(18))
+    .with(pf_reg(19))
+    .with(pf_reg(20))
+    .with(pf_reg(21))
+    .with(pf_reg(22))
+    .with(pf_reg(23))
+    .with(pf_reg(24))
+    .with(pf_reg(25))
+    .with(pf_reg(26))
+    .with(pf_reg(27))
+    .with(pf_reg(28))
+    .with(pf_reg(29))
+    .with(pf_reg(30))
+    .with(pf_reg(31))
     .with(pv_reg(0))
     .with(pv_reg(1))
     .with(pv_reg(2))

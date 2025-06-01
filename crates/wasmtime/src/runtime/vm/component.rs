@@ -6,10 +6,12 @@
 //! Eventually it's intended that module-to-module calls, which would be
 //! cranelift-compiled adapters, will use this `VMComponentContext` as well.
 
+use crate::component::ResourceType;
 use crate::prelude::*;
 use crate::runtime::vm::{
-    SendSyncPtr, VMArrayCallFunction, VMFuncRef, VMGlobalDefinition, VMMemoryDefinition,
-    VMOpaqueContext, VMStore, VMStoreRawPtr, VMWasmCallFunction, ValRaw, VmPtr, VmSafe,
+    SendSyncPtr, VMArrayCallFunction, VMContext, VMFuncRef, VMGlobalDefinition, VMMemoryDefinition,
+    VMOpaqueContext, VMStore, VMStoreRawPtr, VMTable, VMTableDefinition, VMWasmCallFunction,
+    ValRaw, VmPtr, VmSafe,
 };
 use alloc::alloc::Layout;
 use alloc::sync::Arc;
@@ -19,18 +21,19 @@ use core::mem;
 use core::mem::offset_of;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
-use sptr::Strict;
 use wasmtime_environ::component::*;
 use wasmtime_environ::{HostPtr, PrimaryMap, VMSharedTypeIndex};
 
 #[allow(clippy::cast_possible_truncation)] // it's intended this is truncated on
-                                           // 32-bit platforms
+// 32-bit platforms
 const INVALID_PTR: usize = 0xdead_dead_beef_beef_u64 as usize;
 
 mod libcalls;
 mod resources;
 
-pub use self::resources::{CallContexts, ResourceTable, ResourceTables};
+pub use self::resources::{
+    CallContexts, ResourceTable, ResourceTables, TypedResource, TypedResourceIndex,
+};
 
 /// Runtime representation of a component instance and all state necessary for
 /// the instance itself.
@@ -51,20 +54,15 @@ pub struct ComponentInstance {
     /// Runtime type information about this component.
     runtime_info: Arc<dyn ComponentRuntimeInfo>,
 
-    /// State of resources for all `TypeResourceTableIndex` values for this
-    /// component.
+    /// State of resources for this component.
     ///
     /// This is paired with other information to create a `ResourceTables` which
     /// is how this field is manipulated.
-    component_resource_tables: PrimaryMap<TypeResourceTableIndex, ResourceTable>,
+    instance_resource_tables: PrimaryMap<RuntimeComponentInstanceIndex, ResourceTable>,
 
     /// Storage for the type information about resources within this component
     /// instance.
-    ///
-    /// This is actually `Arc<PrimaryMap<ResourceIndex, ResourceType>>` but that
-    /// can't be in this crate because `ResourceType` isn't here. Not using `dyn
-    /// Any` is left as an exercise for a future refactoring.
-    resource_types: Arc<dyn Any + Send + Sync>,
+    resource_types: Arc<PrimaryMap<ResourceIndex, ResourceType>>,
 
     /// Self-pointer back to `Store<T>` and its functions.
     store: VMStoreRawPtr,
@@ -203,15 +201,16 @@ impl ComponentInstance {
         alloc_size: usize,
         offsets: VMComponentOffsets<HostPtr>,
         runtime_info: Arc<dyn ComponentRuntimeInfo>,
-        resource_types: Arc<dyn Any + Send + Sync>,
+        resource_types: Arc<PrimaryMap<ResourceIndex, ResourceType>>,
         store: NonNull<dyn VMStore>,
     ) {
         assert!(alloc_size >= Self::alloc_layout(&offsets).size());
 
-        let num_tables = runtime_info.component().num_resource_tables;
-        let mut component_resource_tables = PrimaryMap::with_capacity(num_tables);
-        for _ in 0..num_tables {
-            component_resource_tables.push(ResourceTable::default());
+        let num_instances = runtime_info.component().num_runtime_component_instances;
+        let mut instance_resource_tables =
+            PrimaryMap::with_capacity(num_instances.try_into().unwrap());
+        for _ in 0..num_instances {
+            instance_resource_tables.push(ResourceTable::default());
         }
 
         ptr::write(
@@ -226,7 +225,7 @@ impl ComponentInstance {
                     )
                     .unwrap(),
                 ),
-                component_resource_tables,
+                instance_resource_tables,
                 runtime_info,
                 resource_types,
                 store: VMStoreRawPtr(store),
@@ -241,7 +240,7 @@ impl ComponentInstance {
 
     fn vmctx(&self) -> NonNull<VMComponentContext> {
         let addr = &raw const self.vmctx;
-        let ret = Strict::with_addr(self.vmctx_self_reference.as_ptr(), Strict::addr(addr));
+        let ret = self.vmctx_self_reference.as_ptr().with_addr(addr.addr());
         NonNull::new(ret).unwrap()
     }
 
@@ -286,6 +285,20 @@ impl ComponentInstance {
             let ret = *self.vmctx_plus_offset::<VmPtr<_>>(self.offsets.runtime_memory(idx));
             debug_assert!(ret.as_ptr() as usize != INVALID_PTR);
             ret.as_ptr()
+        }
+    }
+
+    /// Returns the runtime table definition and associated instance `VMContext`
+    /// corresponding to the index of the table provided.
+    ///
+    /// This can only be called after `idx` has been initialized at runtime
+    /// during the instantiation process of a component.
+    pub fn runtime_table(&self, idx: RuntimeTableIndex) -> VMTable {
+        unsafe {
+            let ret = *self.vmctx_plus_offset::<VMTable>(self.offsets.runtime_table(idx));
+            debug_assert!(ret.from.as_ptr() as usize != INVALID_PTR);
+            debug_assert!(ret.vmctx.as_ptr() as usize != INVALID_PTR);
+            ret
         }
     }
 
@@ -401,6 +414,31 @@ impl ComponentInstance {
                 .vmctx_plus_offset_mut::<VmPtr<VMFuncRef>>(self.offsets.runtime_post_return(idx));
             debug_assert!((*storage).as_ptr() as usize == INVALID_PTR);
             *storage = ptr.into();
+        }
+    }
+
+    /// Stores the runtime table pointer at the index specified.
+    ///
+    /// This is intended to be called during the instantiation process of a
+    /// component once a table is available, which may not be until part-way
+    /// through component instantiation.
+    ///
+    /// Note that it should be a property of the component model that the `ptr`
+    /// here is never needed prior to it being configured here in the instance.
+    pub fn set_runtime_table(
+        &mut self,
+        idx: RuntimeTableIndex,
+        ptr: NonNull<VMTableDefinition>,
+        vmctx: NonNull<VMContext>,
+    ) {
+        unsafe {
+            let storage = self.vmctx_plus_offset_mut::<VMTable>(self.offsets.runtime_table(idx));
+            debug_assert!((*storage).vmctx.as_ptr() as usize == INVALID_PTR);
+            debug_assert!((*storage).from.as_ptr() as usize == INVALID_PTR);
+            *storage = VMTable {
+                vmctx: vmctx.into(),
+                from: ptr.into(),
+            };
         }
     }
 
@@ -523,6 +561,11 @@ impl ComponentInstance {
                 let offset = self.offsets.resource_destructor(i);
                 *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
             }
+            for i in 0..self.offsets.num_runtime_tables {
+                let i = RuntimeTableIndex::from_u32(i);
+                let offset = self.offsets.runtime_table(i);
+                *self.vmctx_plus_offset_mut(offset) = INVALID_PTR;
+            }
         }
     }
 
@@ -541,10 +584,8 @@ impl ComponentInstance {
         self.runtime_info.realloc_func_type()
     }
 
-    /// Returns a reference to the resource type information as a `dyn Any`.
-    ///
-    /// Wasmtime is the one which then downcasts this to the appropriate type.
-    pub fn resource_types(&self) -> &Arc<dyn Any + Send + Sync> {
+    /// Returns a reference to the resource type information.
+    pub fn resource_types(&self) -> &Arc<PrimaryMap<ResourceIndex, ResourceType>> {
         &self.resource_types
     }
 
@@ -565,23 +606,22 @@ impl ComponentInstance {
 
     /// Implementation of the `resource.new` intrinsic for `i32`
     /// representations.
-    pub fn resource_new32(&mut self, resource: TypeResourceTableIndex, rep: u32) -> Result<u32> {
-        self.resource_tables().resource_new(Some(resource), rep)
+    pub fn resource_new32(&mut self, ty: TypeResourceTableIndex, rep: u32) -> Result<u32> {
+        self.resource_tables()
+            .resource_new(TypedResource::Component { ty, rep })
     }
 
     /// Implementation of the `resource.rep` intrinsic for `i32`
     /// representations.
-    pub fn resource_rep32(&mut self, resource: TypeResourceTableIndex, idx: u32) -> Result<u32> {
-        self.resource_tables().resource_rep(Some(resource), idx)
+    pub fn resource_rep32(&mut self, ty: TypeResourceTableIndex, index: u32) -> Result<u32> {
+        self.resource_tables()
+            .resource_rep(TypedResourceIndex::Component { ty, index })
     }
 
     /// Implementation of the `resource.drop` intrinsic.
-    pub fn resource_drop(
-        &mut self,
-        resource: TypeResourceTableIndex,
-        idx: u32,
-    ) -> Result<Option<u32>> {
-        self.resource_tables().resource_drop(Some(resource), idx)
+    pub fn resource_drop(&mut self, ty: TypeResourceTableIndex, index: u32) -> Result<Option<u32>> {
+        self.resource_tables()
+            .resource_drop(TypedResourceIndex::Component { ty, index })
     }
 
     /// NB: this is intended to be a private method. This does not have
@@ -595,16 +635,25 @@ impl ComponentInstance {
         ResourceTables {
             host_table: None,
             calls: unsafe { (&mut *self.store()).component_calls() },
-            tables: Some(&mut self.component_resource_tables),
+            guest: Some((
+                &mut self.instance_resource_tables,
+                self.runtime_info.component_types(),
+            )),
         }
     }
 
     /// Returns the runtime state of resources associated with this component.
     #[inline]
-    pub fn component_resource_tables(
+    pub fn guest_tables(
         &mut self,
-    ) -> &mut PrimaryMap<TypeResourceTableIndex, ResourceTable> {
-        &mut self.component_resource_tables
+    ) -> (
+        &mut PrimaryMap<RuntimeComponentInstanceIndex, ResourceTable>,
+        &ComponentTypes,
+    ) {
+        (
+            &mut self.instance_resource_tables,
+            self.runtime_info.component_types(),
+        )
     }
 
     /// Returns the destructor and instance flags for the specified resource
@@ -628,24 +677,24 @@ impl ComponentInstance {
 
     pub(crate) fn resource_transfer_own(
         &mut self,
-        idx: u32,
+        index: u32,
         src: TypeResourceTableIndex,
         dst: TypeResourceTableIndex,
     ) -> Result<u32> {
         let mut tables = self.resource_tables();
-        let rep = tables.resource_lift_own(Some(src), idx)?;
-        tables.resource_lower_own(Some(dst), rep)
+        let rep = tables.resource_lift_own(TypedResourceIndex::Component { ty: src, index })?;
+        tables.resource_lower_own(TypedResource::Component { ty: dst, rep })
     }
 
     pub(crate) fn resource_transfer_borrow(
         &mut self,
-        idx: u32,
+        index: u32,
         src: TypeResourceTableIndex,
         dst: TypeResourceTableIndex,
     ) -> Result<u32> {
         let dst_owns_resource = self.resource_owned_by_own_instance(dst);
         let mut tables = self.resource_tables();
-        let rep = tables.resource_lift_borrow(Some(src), idx)?;
+        let rep = tables.resource_lift_borrow(TypedResourceIndex::Component { ty: src, index })?;
         // Implement `lower_borrow`'s special case here where if a borrow's
         // resource type is owned by `dst` then the destination receives the
         // representation directly rather than a handle to the representation.
@@ -657,7 +706,7 @@ impl ComponentInstance {
         if dst_owns_resource {
             return Ok(rep);
         }
-        tables.resource_lower_borrow(Some(dst), rep)
+        tables.resource_lower_borrow(TypedResource::Component { ty: dst, rep })
     }
 
     pub(crate) fn resource_enter_call(&mut self) {
@@ -728,7 +777,7 @@ impl OwnedComponentInstance {
     /// heap with `malloc` and configures it for the `component` specified.
     pub fn new(
         runtime_info: Arc<dyn ComponentRuntimeInfo>,
-        resource_types: Arc<dyn Any + Send + Sync>,
+        resource_types: Arc<PrimaryMap<ResourceIndex, ResourceType>>,
         store: NonNull<dyn VMStore>,
     ) -> OwnedComponentInstance {
         let component = runtime_info.component();
@@ -801,6 +850,16 @@ impl OwnedComponentInstance {
         unsafe { self.instance_mut().set_runtime_post_return(idx, ptr) }
     }
 
+    /// See `ComponentInstance::set_runtime_table`
+    pub fn set_runtime_table(
+        &mut self,
+        idx: RuntimeTableIndex,
+        ptr: NonNull<VMTableDefinition>,
+        vmctx: NonNull<VMContext>,
+    ) {
+        unsafe { self.instance_mut().set_runtime_table(idx, ptr, vmctx) }
+    }
+
     /// See `ComponentInstance::set_lowering`
     pub fn set_lowering(&mut self, idx: LoweredIndex, lowering: VMLowering) {
         unsafe { self.instance_mut().set_lowering(idx, lowering) }
@@ -830,7 +889,7 @@ impl OwnedComponentInstance {
     }
 
     /// See `ComponentInstance::resource_types`
-    pub fn resource_types_mut(&mut self) -> &mut Arc<dyn Any + Send + Sync> {
+    pub fn resource_types_mut(&mut self) -> &mut Arc<PrimaryMap<ResourceIndex, ResourceType>> {
         unsafe { &mut (*self.ptr.as_ptr()).resource_types }
     }
 }

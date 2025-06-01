@@ -9,22 +9,23 @@ use crate::entity::SecondaryMap;
 use crate::inst_predicates::{has_lowering_side_effect, is_constant_64bit};
 use crate::ir::pcc::{Fact, FactContext, PccError, PccResult};
 use crate::ir::{
-    ArgumentPurpose, Block, Constant, ConstantData, DataFlowGraph, ExternalName, Function,
-    GlobalValue, GlobalValueData, Immediate, Inst, InstructionData, MemFlags, RelSourceLoc, Type,
-    Value, ValueDef, ValueLabelAssignments, ValueLabelStart,
+    ArgumentPurpose, Block, BlockArg, Constant, ConstantData, DataFlowGraph, ExternalName,
+    Function, GlobalValue, GlobalValueData, Immediate, Inst, InstructionData, MemFlags,
+    RelSourceLoc, SigRef, Signature, Type, Value, ValueDef, ValueLabelAssignments, ValueLabelStart,
 };
 use crate::machinst::valueregs::InvalidSentinel;
 use crate::machinst::{
-    writable_value_regs, BackwardsInsnIndex, BlockIndex, BlockLoweringOrder, Callee, InsnIndex,
-    LoweredBlock, MachLabel, Reg, SigSet, VCode, VCodeBuilder, VCodeConstant, VCodeConstantData,
-    VCodeConstants, VCodeInst, ValueRegs, Writable,
+    ABIMachineSpec, BackwardsInsnIndex, BlockIndex, BlockLoweringOrder, CallArgList, CallInfo,
+    CallRetList, Callee, InsnIndex, LoweredBlock, MachLabel, Reg, Sig, SigSet, TryCallInfo, VCode,
+    VCodeBuilder, VCodeConstant, VCodeConstantData, VCodeConstants, VCodeInst, ValueRegs, Writable,
+    writable_value_regs,
 };
 use crate::settings::Flags;
-use crate::{trace, CodegenError, CodegenResult};
+use crate::{CodegenError, CodegenResult, trace};
 use alloc::vec::Vec;
 use cranelift_control::ControlPlane;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::fmt::Debug;
 
 use super::{VCodeBuildDirection, VRegAllocator};
@@ -170,7 +171,7 @@ pub trait LowerBackend {
 /// from original Inst to MachInsts.
 pub struct Lower<'func, I: VCodeInst> {
     /// The function to lower.
-    f: &'func Function,
+    pub(crate) f: &'func Function,
 
     /// Lowered machine instructions.
     vcode: VCodeBuilder<I>,
@@ -222,6 +223,14 @@ pub struct Lower<'func, I: VCodeInst> {
 
     /// Instructions collected for the CLIF inst in progress, in forward order.
     ir_insts: Vec<I>,
+
+    /// Try-call block arg normal-return values, indexed by instruction.
+    try_call_rets: FxHashMap<Inst, SmallVec<[ValueRegs<Writable<Reg>>; 2]>>,
+
+    /// Try-call block arg exceptional-return payloads, indexed by
+    /// instruction. Payloads are carried in registers per the ABI and
+    /// can only be one register each.
+    try_call_payloads: FxHashMap<Inst, SmallVec<[Writable<Reg>; 2]>>,
 
     /// The register to use for GetPinnedReg, if any, on this architecture.
     pinned_reg: Option<Reg>,
@@ -390,8 +399,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let mut vregs = VRegAllocator::with_capacity(f.dfg.num_values() * 2);
 
         let mut value_regs = SecondaryMap::with_default(ValueRegs::invalid());
+        let mut try_call_rets = FxHashMap::default();
+        let mut try_call_payloads = FxHashMap::default();
 
-        // Assign a vreg to each block param and each inst result.
+        // Assign a vreg to each block param, each inst result, and
+        // each edge-defined block-call arg.
         for bb in f.layout.blocks() {
             for &param in f.dfg.block_params(bb) {
                 let ty = f.dfg.value_type(param);
@@ -409,13 +421,29 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                         value_regs[result] = regs;
                         trace!(
                             "bb {} inst {} ({:?}): result {} regs {:?}",
-                            bb,
-                            inst,
-                            f.dfg.insts[inst],
-                            result,
-                            regs,
+                            bb, inst, f.dfg.insts[inst], result, regs,
                         );
                     }
+                }
+
+                if let Some(et) = f.dfg.insts[inst].exception_table() {
+                    let exdata = &f.dfg.exception_tables[et];
+                    let sig = &f.dfg.signatures[exdata.signature()];
+
+                    let mut rets = smallvec![];
+                    for ty in sig.returns.iter().map(|ret| ret.value_type) {
+                        rets.push(vregs.alloc(ty)?.map(|r| Writable::from_reg(r)));
+                    }
+                    try_call_rets.insert(inst, rets);
+
+                    let mut payloads = smallvec![];
+                    for &ty in sig
+                        .call_conv
+                        .exception_payload_types(I::ABIMachineSpec::word_type())
+                    {
+                        payloads.push(Writable::from_reg(vregs.alloc(ty)?.only_reg().unwrap()));
+                    }
+                    try_call_payloads.insert(inst, payloads);
                 }
             }
         }
@@ -492,6 +520,8 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             cur_scan_entry_color: None,
             cur_inst: None,
             ir_insts: vec![],
+            try_call_rets,
+            try_call_payloads,
             pinned_reg: None,
             flags,
         })
@@ -503,6 +533,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
     pub fn sigs_mut(&mut self) -> &mut SigSet {
         self.vcode.sigs_mut()
+    }
+
+    pub fn vregs_mut(&mut self) -> &mut VRegAllocator<I> {
+        &mut self.vregs
     }
 
     fn gen_arg_setup(&mut self) {
@@ -550,7 +584,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     /// Generate the return instruction.
-    pub fn gen_return(&mut self, rets: Vec<ValueRegs<Reg>>) {
+    pub fn gen_return(&mut self, rets: &[ValueRegs<Reg>]) {
         let mut out_rets = vec![];
 
         let mut rets = rets.into_iter();
@@ -565,7 +599,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             let regs = if ret.purpose == ArgumentPurpose::StructReturn {
                 self.sret_reg.unwrap()
             } else {
-                rets.next().unwrap()
+                *rets.next().unwrap()
             };
 
             let (regs, insns) = self.vcode.abi().gen_copy_regs_to_retval(
@@ -594,6 +628,88 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         let inst = self.abi().gen_rets(out_rets);
         self.emit(inst);
+    }
+
+    /// Generate list of registers to hold the output of a call with
+    /// signature `sig`.
+    pub fn gen_call_output(&mut self, sig: &Signature) -> InstOutput {
+        let mut rets = smallvec![];
+        for ty in sig.returns.iter().map(|ret| ret.value_type) {
+            rets.push(self.vregs.alloc_with_deferred_error(ty));
+        }
+        rets
+    }
+
+    /// Likewise, but for a `SigRef` instead.
+    pub fn gen_call_output_from_sig_ref(&mut self, sig_ref: SigRef) -> InstOutput {
+        self.gen_call_output(&self.f.dfg.signatures[sig_ref])
+    }
+
+    /// Set up arguments values `args` for a call with signature `sig`.
+    pub fn gen_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+        let (uses, insts) = self.vcode.abi().gen_call_args(
+            self.vcode.sigs(),
+            sig,
+            args,
+            /* is_tail_call */ false,
+            &self.flags,
+            &mut self.vregs,
+        );
+        for insn in insts {
+            self.emit(insn);
+        }
+        uses
+    }
+
+    /// Likewise, but for a `return_call`.
+    pub fn gen_return_call_args(&mut self, sig: Sig, args: &[ValueRegs<Reg>]) -> CallArgList {
+        let (uses, insts) = self.vcode.abi().gen_call_args(
+            self.vcode.sigs(),
+            sig,
+            args,
+            /* is_tail_call */ true,
+            &self.flags,
+            &mut self.vregs,
+        );
+        for insn in insts {
+            self.emit(insn);
+        }
+        uses
+    }
+
+    /// Set up return values `outputs` for a call with signature `sig`.
+    pub fn gen_call_rets(&mut self, sig: Sig, outputs: &[ValueRegs<Reg>]) -> CallRetList {
+        self.vcode
+            .abi()
+            .gen_call_rets(self.vcode.sigs(), sig, outputs, None, &mut self.vregs)
+    }
+
+    /// Likewise, but for a `try_call`.
+    pub fn gen_try_call_rets(&mut self, sig: Sig) -> CallRetList {
+        let ir_inst = self.cur_inst.unwrap();
+        let mut outputs: SmallVec<[ValueRegs<Reg>; 2]> = smallvec![];
+        for return_def in self.try_call_rets.get(&ir_inst).unwrap() {
+            outputs.push(return_def.map(|r| r.to_reg()));
+        }
+        let payloads = Some(&self.try_call_payloads.get(&ir_inst).unwrap()[..]);
+
+        self.vcode
+            .abi()
+            .gen_call_rets(self.vcode.sigs(), sig, &outputs, payloads, &mut self.vregs)
+    }
+
+    /// Populate a `CallInfo` for a call with signature `sig`.
+    pub fn gen_call_info<T>(
+        &mut self,
+        sig: Sig,
+        dest: T,
+        uses: CallArgList,
+        defs: CallRetList,
+        try_call_info: Option<TryCallInfo>,
+    ) -> CallInfo<T> {
+        self.vcode
+            .abi()
+            .gen_call_info(self.vcode.sigs(), sig, dest, uses, defs, try_call_info)
     }
 
     /// Has this instruction been sunk to a use-site (i.e., away from its
@@ -672,6 +788,10 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             if self.f.dfg.insts[inst].opcode().is_branch() {
                 continue;
             }
+
+            // Value defined by "inst" becomes live after it in normal
+            // order, and therefore **before** in reversed order.
+            self.emit_value_label_live_range_start_for_inst(inst);
 
             // Normal instruction: codegen if the instruction is side-effecting
             // or any of its outputs is used.
@@ -764,11 +884,6 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                     }
                 }
             }
-
-            // Emit value-label markers if needed, to later recover
-            // debug mappings. This must happen before the instruction
-            // (so after we emit, in bottom-to-top pass).
-            self.emit_value_label_markers_for_inst(inst);
         }
 
         // Add the block params to this block.
@@ -823,16 +938,14 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             for label in labels {
                 trace!(
                     "value labeling: defines val {:?} -> reg {:?} -> label {:?}",
-                    val,
-                    reg,
-                    label,
+                    val, reg, label,
                 );
                 self.vcode.add_value_label(reg, label);
             }
         }
     }
 
-    fn emit_value_label_markers_for_inst(&mut self, inst: Inst) {
+    fn emit_value_label_live_range_start_for_inst(&mut self, inst: Inst) {
         if self.f.dfg.values_labels.is_none() {
             return;
         }
@@ -847,7 +960,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         }
     }
 
-    fn emit_value_label_markers_for_block_args(&mut self, block: Block) {
+    fn emit_value_label_live_range_start_for_block_args(&mut self, block: Block) {
         if self.f.dfg.values_labels.is_none() {
             return;
         }
@@ -872,7 +985,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         self.vcode.end_bb();
     }
 
-    fn lower_clif_branches<B: LowerBackend<MInst = I>>(
+    fn lower_clif_branch<B: LowerBackend<MInst = I>>(
         &mut self,
         backend: &B,
         // Lowered block index:
@@ -883,10 +996,8 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         targets: &[MachLabel],
     ) -> CodegenResult<()> {
         trace!(
-            "lower_clif_branches: block {} branch {:?} targets {:?}",
-            block,
-            branch,
-            targets,
+            "lower_clif_branch: block {} branch {:?} targets {:?}",
+            block, branch, targets,
         );
         // When considering code-motion opportunities, consider the current
         // program point to be this branch.
@@ -909,31 +1020,17 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     }
 
     fn lower_branch_blockparam_args(&mut self, block: BlockIndex) {
+        let mut branch_arg_vregs: SmallVec<[Reg; 16]> = smallvec![];
+
         // TODO: why not make `block_order` public?
         for succ_idx in 0..self.vcode.block_order().succ_indices(block).1.len() {
-            // Avoid immutable borrow by explicitly indexing.
-            let (opt_inst, succs) = self.vcode.block_order().succ_indices(block);
-            let inst = opt_inst.expect("lower_branch_blockparam_args called on a critical edge!");
-            let succ = succs[succ_idx];
-
-            // The use of `succ_idx` to index `branch_destination` is valid on the assumption that
-            // the traversal order defined in `visit_block_succs` mirrors the order returned by
-            // `branch_destination`. If that assumption is violated, the branch targets returned
-            // here will not match the clif.
-            let branches = self.f.dfg.insts[inst].branch_destination(&self.f.dfg.jump_tables);
-            let branch_args = branches[succ_idx].args_slice(&self.f.dfg.value_lists);
-
-            let mut branch_arg_vregs: SmallVec<[Reg; 16]> = smallvec![];
-            for &arg in branch_args {
-                debug_assert!(self.f.dfg.value_is_real(arg));
-                let regs = self.put_value_in_regs(arg);
-                branch_arg_vregs.extend_from_slice(regs.regs());
-            }
-            self.vcode.add_succ(succ, &branch_arg_vregs[..]);
+            branch_arg_vregs.clear();
+            let (succ, args) = self.collect_block_call(block, succ_idx, &mut branch_arg_vregs);
+            self.vcode.add_succ(succ, args);
         }
     }
 
-    fn collect_branches_and_targets(
+    fn collect_branch_and_targets(
         &self,
         bindex: BlockIndex,
         _bb: Block,
@@ -943,6 +1040,69 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         let (opt_inst, succs) = self.vcode.block_order().succ_indices(bindex);
         targets.extend(succs.iter().map(|succ| MachLabel::from_block(*succ)));
         opt_inst
+    }
+
+    /// Collect the outgoing block-call arguments for a given edge out
+    /// of a lowered block.
+    fn collect_block_call<'a>(
+        &mut self,
+        block: BlockIndex,
+        succ_idx: usize,
+        buffer: &'a mut SmallVec<[Reg; 16]>,
+    ) -> (BlockIndex, &'a [Reg]) {
+        let block_order = self.vcode.block_order();
+        let (_, succs) = block_order.succ_indices(block);
+        let succ = succs[succ_idx];
+        let this_lb = block_order.lowered_order()[block.index()];
+        let succ_lb = block_order.lowered_order()[succ.index()];
+
+        let (branch_inst, succ_idx) = match (this_lb, succ_lb) {
+            (_, LoweredBlock::CriticalEdge { .. }) => {
+                // The successor is a split-critical-edge block. In this
+                // case, this block-call has no arguments, and the
+                // arguments go on the critical edge block's unconditional
+                // branch instead.
+                return (succ, &[]);
+            }
+            (LoweredBlock::CriticalEdge { pred, succ_idx, .. }, _) => {
+                // This is a split-critical-edge block. In this case, our
+                // block-call has the arguments that in the CLIF appear in
+                // the predecessor's branch to this edge.
+                let branch_inst = self.f.layout.last_inst(pred).unwrap();
+                (branch_inst, succ_idx as usize)
+            }
+
+            (this, _) => {
+                let block = this.orig_block().unwrap();
+                // Ordinary block, with an ordinary block as
+                // successor. Take the arguments from the branch.
+                let branch_inst = self.f.layout.last_inst(block).unwrap();
+                (branch_inst, succ_idx)
+            }
+        };
+
+        let block_call = self.f.dfg.insts[branch_inst]
+            .branch_destination(&self.f.dfg.jump_tables, &self.f.dfg.exception_tables)[succ_idx];
+        for arg in block_call.args(&self.f.dfg.value_lists) {
+            match arg {
+                BlockArg::Value(arg) => {
+                    debug_assert!(self.f.dfg.value_is_real(arg));
+                    let regs = self.put_value_in_regs(arg);
+                    buffer.extend_from_slice(regs.regs());
+                }
+                BlockArg::TryCallRet(i) => {
+                    let regs = self.try_call_rets.get(&branch_inst).unwrap()[i as usize]
+                        .map(|r| r.to_reg());
+                    buffer.extend_from_slice(regs.regs());
+                }
+                BlockArg::TryCallExn(i) => {
+                    let reg =
+                        self.try_call_payloads.get(&branch_inst).unwrap()[i as usize].to_reg();
+                    buffer.push(reg);
+                }
+            }
+        }
+        (succ, &buffer[..])
     }
 
     /// Lower the function.
@@ -981,45 +1141,28 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
             // Lower the block body in reverse order (see comment in
             // `lower_clif_block()` for rationale).
 
-            // End branches.
+            // End branch.
             if let Some(bb) = lb.orig_block() {
-                if let Some(branch) = self.collect_branches_and_targets(bindex, bb, &mut targets) {
-                    self.lower_clif_branches(backend, bindex, bb, branch, &targets)?;
+                if let Some(branch) = self.collect_branch_and_targets(bindex, bb, &mut targets) {
+                    self.lower_clif_branch(backend, bindex, bb, branch, &targets)?;
                     self.finish_ir_inst(self.srcloc(branch));
                 }
             } else {
                 // If no orig block, this must be a pure edge block;
-                // get the successor and emit a jump. Add block params
-                // according to the one successor, and pass them
-                // through; note that the successor must have an
-                // original block.
-                let (_, succs) = self.vcode.block_order().succ_indices(bindex);
-                let succ = succs[0];
-
-                let orig_succ = lowered_order[succ.index()];
-                let orig_succ = orig_succ
-                    .orig_block()
-                    .expect("Edge block succ must be body block");
-
-                let mut branch_arg_vregs: SmallVec<[Reg; 16]> = smallvec![];
-                for ty in self.f.dfg.block_param_types(orig_succ) {
-                    let regs = self.vregs.alloc(ty)?;
-                    for &reg in regs.regs() {
-                        branch_arg_vregs.push(reg);
-                        let vreg = reg.to_virtual_reg().unwrap();
-                        self.vcode.add_block_param(vreg);
-                    }
-                }
-                self.vcode.add_succ(succ, &branch_arg_vregs[..]);
-
+                // get the successor and emit a jump. This block has
+                // no block params; and this jump's block-call args
+                // will be filled in by
+                // `lower_branch_blockparam_args`.
+                let succ = self.vcode.block_order().succ_indices(bindex).1[0];
                 self.emit(I::gen_jump(MachLabel::from_block(succ)));
                 self.finish_ir_inst(Default::default());
+                self.lower_branch_blockparam_args(bindex);
             }
 
             // Original block body.
             if let Some(bb) = lb.orig_block() {
                 self.lower_clif_block(backend, bb, ctrl_plane)?;
-                self.emit_value_label_markers_for_block_args(bb);
+                self.emit_value_label_live_range_start_for_block_args(bb);
             }
 
             if bindex.index() == 0 {
@@ -1041,8 +1184,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
         // VCodeBuilder, let's build the VCode.
         trace!(
             "built vcode:\n{:?}Backwards {:?}",
-            &self.vregs,
-            &self.vcode.vcode
+            &self.vregs, &self.vcode.vcode
         );
         let vcode = self.vcode.build(self.vregs);
 
@@ -1346,9 +1488,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     pub fn get_value_as_source_or_const(&self, val: Value) -> NonRegInput {
         trace!(
             "get_input_for_val: val {} at cur_inst {:?} cur_scan_entry_color {:?}",
-            val,
-            self.cur_inst,
-            self.cur_scan_entry_color,
+            val, self.cur_inst, self.cur_scan_entry_color,
         );
         let inst = match self.f.dfg.value_def(val) {
             // OK to merge source instruction if we have a source
@@ -1414,9 +1554,7 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
                     // the code-motion.
                     trace!(
                         " -> side-effecting op {} for val {}: use state {:?}",
-                        src_inst,
-                        val,
-                        self.value_ir_uses[val]
+                        src_inst, val, self.value_ir_uses[val]
                     );
                     if self.cur_scan_entry_color.is_some()
                         && self.value_ir_uses[val] == ValueUseState::Once
@@ -1470,6 +1608,18 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
 
         regs
     }
+
+    /// Get the ValueRegs for the edge-defined values for special
+    /// try-call-return block arguments.
+    pub fn try_call_return_defs(&mut self, ir_inst: Inst) -> &[ValueRegs<Writable<Reg>>] {
+        &self.try_call_rets.get(&ir_inst).unwrap()[..]
+    }
+
+    /// Get the Regs for the edge-defined values for special
+    /// try-call-return exception payload arguments.
+    pub fn try_call_exception_defs(&mut self, ir_inst: Inst) -> &[Writable<Reg>] {
+        &self.try_call_payloads.get(&ir_inst).unwrap()[..]
+    }
 }
 
 /// Codegen primitives: allocate temps, emit instructions, set result registers,
@@ -1478,6 +1628,11 @@ impl<'func, I: VCodeInst> Lower<'func, I> {
     /// Get a new temp.
     pub fn alloc_tmp(&mut self, ty: Type) -> ValueRegs<Writable<Reg>> {
         writable_value_regs(self.vregs.alloc_with_deferred_error(ty))
+    }
+
+    /// Get the current root instruction that we are lowering.
+    pub fn cur_inst(&self) -> Inst {
+        self.cur_inst.unwrap()
     }
 
     /// Emit a machine instruction.

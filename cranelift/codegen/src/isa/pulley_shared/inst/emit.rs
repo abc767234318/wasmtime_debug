@@ -3,8 +3,8 @@
 use super::*;
 use crate::ir::{self, Endianness};
 use crate::isa;
-use crate::isa::pulley_shared::abi::PulleyMachineDeps;
 use crate::isa::pulley_shared::PointerWidth;
+use crate::isa::pulley_shared::abi::PulleyMachineDeps;
 use core::marker::PhantomData;
 use cranelift_control::ControlPlane;
 use pulley_interpreter::encode as enc;
@@ -182,12 +182,37 @@ fn pulley_emit<P>(
                 let offset = sink.cur_offset();
                 sink.push_user_stack_map(state, offset, s);
             }
-            sink.add_call_site();
+
+            if let Some(try_call) = info.try_call_info.as_ref() {
+                sink.add_call_site(&try_call.exception_dests);
+            } else {
+                sink.add_call_site(&[]);
+            }
 
             let adjust = -i32::try_from(info.callee_pop_size).unwrap();
             for i in PulleyMachineDeps::<P>::gen_sp_reg_adjust(adjust) {
-                <InstAndKind<P>>::from(i).emit(sink, emit_info, state);
+                i.emit(sink, emit_info, state);
             }
+
+            // Load any stack-carried return values.
+            info.emit_retval_loads::<PulleyMachineDeps<P>, _, _>(
+                state.frame_layout().stackslots_size,
+                |inst| inst.emit(sink, emit_info, state),
+                |space_needed| Some(<InstAndKind<P>>::from(Inst::EmitIsland { space_needed })),
+            );
+
+            // If this is a try-call, jump to the continuation
+            // (normal-return) block.
+            if let Some(try_call) = info.try_call_info.as_ref() {
+                let jmp = InstAndKind::<P>::from(Inst::Jump {
+                    label: try_call.continuation,
+                });
+                jmp.emit(sink, emit_info, state);
+            }
+
+            // We produce an island above if needed, so disable
+            // the worst-case-size check in this case.
+            *start_offset = sink.cur_offset();
         }
 
         Inst::IndirectCall { info } => {
@@ -198,12 +223,36 @@ fn pulley_emit<P>(
                 sink.push_user_stack_map(state, offset, s);
             }
 
-            sink.add_call_site();
+            if let Some(try_call) = info.try_call_info.as_ref() {
+                sink.add_call_site(&try_call.exception_dests);
+            } else {
+                sink.add_call_site(&[]);
+            }
 
             let adjust = -i32::try_from(info.callee_pop_size).unwrap();
             for i in PulleyMachineDeps::<P>::gen_sp_reg_adjust(adjust) {
-                <InstAndKind<P>>::from(i).emit(sink, emit_info, state);
+                i.emit(sink, emit_info, state);
             }
+
+            // Load any stack-carried return values.
+            info.emit_retval_loads::<PulleyMachineDeps<P>, _, _>(
+                state.frame_layout().stackslots_size,
+                |inst| inst.emit(sink, emit_info, state),
+                |space_needed| Some(<InstAndKind<P>>::from(Inst::EmitIsland { space_needed })),
+            );
+
+            // If this is a try-call, jump to the continuation
+            // (normal-return) block.
+            if let Some(try_call) = info.try_call_info.as_ref() {
+                let jmp = InstAndKind::<P>::from(Inst::Jump {
+                    label: try_call.continuation,
+                });
+                jmp.emit(sink, emit_info, state);
+            }
+
+            // We produce an island above if needed, so disable
+            // the worst-case-size check in this case.
+            *start_offset = sink.cur_offset();
         }
 
         Inst::ReturnCall { info } => {
@@ -239,7 +288,7 @@ fn pulley_emit<P>(
                 let offset = sink.cur_offset();
                 sink.push_user_stack_map(state, offset, s);
             }
-            sink.add_call_site();
+            sink.add_call_site(&[]);
 
             // If a callee pop is happening here that means that something has
             // messed up, these are expected to be "very simple" signatures.
@@ -517,6 +566,15 @@ fn pulley_emit<P>(
             }
             super::generated::emit(raw, sink)
         }
+
+        Inst::EmitIsland { space_needed } => {
+            if sink.island_needed(*space_needed) {
+                let label = sink.get_label();
+                <InstAndKind<P>>::from(Inst::Jump { label }).emit(sink, emit_info, state);
+                sink.emit_island(space_needed + 8, &mut state.ctrl_plane);
+                sink.bind_label(label, &mut state.ctrl_plane);
+            }
+        }
     }
 }
 
@@ -590,7 +648,7 @@ fn return_call_emit_impl<T, P>(
     if incoming_args_diff != 0 {
         let amt = i32::try_from(incoming_args_diff).unwrap();
         for inst in PulleyMachineDeps::<P>::gen_sp_reg_adjust(amt) {
-            <InstAndKind<P>>::from(inst).emit(sink, emit_info, state);
+            inst.emit(sink, emit_info, state);
         }
     }
 }

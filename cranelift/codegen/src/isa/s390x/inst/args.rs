@@ -1,7 +1,7 @@
 //! S390x ISA definitions: instruction arguments.
 
-use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::MemFlags;
+use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::isa::s390x::inst::*;
 
 //=============================================================================
@@ -32,6 +32,9 @@ pub enum MemArg {
     /// PC-relative Reference to a label.
     Label { target: MachLabel },
 
+    /// PC-relative Reference to a constant pool entry.
+    Constant { constant: VCodeConstant },
+
     /// PC-relative Reference to a near symbol.
     Symbol {
         name: Box<ExternalName>,
@@ -49,8 +52,11 @@ pub enum MemArg {
     /// Offset from the stack pointer at function entry.
     InitialSPOffset { off: i64 },
 
-    /// Offset from the (nominal) stack pointer during this function.
-    NominalSPOffset { off: i64 },
+    /// Offset from the top of the incoming argument area.
+    IncomingArgOffset { off: i64 },
+
+    /// Offset from the bottom of the outgoing argument area.
+    OutgoingArgOffset { off: i64 },
 
     /// Offset into the slot area of the stack, which lies just above the
     /// outgoing argument area that's setup by the function prologue.
@@ -63,6 +69,9 @@ pub enum MemArg {
     /// adjustment meta-instructions). See the diagram in the documentation
     /// for [crate::isa::aarch64::abi](the ABI module) for more details.
     SlotOffset { off: i64 },
+
+    /// Offset into the spill area of the stack.
+    SpillOffset { off: i64 },
 }
 
 impl MemArg {
@@ -86,28 +95,9 @@ impl MemArg {
         }
     }
 
-    /// Memory reference using the sum of a register an an offset as address.
+    /// Memory reference using the sum of a register an offset as address.
     pub fn reg_plus_off(reg: Reg, off: i64, flags: MemFlags) -> MemArg {
         MemArg::RegOffset { reg, off, flags }
-    }
-
-    /// Add an offset to a virtual addressing mode.
-    pub fn offset(base: &MemArg, offset: i64) -> MemArg {
-        match base {
-            &MemArg::RegOffset { reg, off, flags } => MemArg::RegOffset {
-                reg,
-                off: off + offset,
-                flags,
-            },
-            &MemArg::InitialSPOffset { off } => MemArg::InitialSPOffset { off: off + offset },
-            &MemArg::NominalSPOffset { off } => MemArg::NominalSPOffset { off: off + offset },
-            &MemArg::SlotOffset { off } => MemArg::SlotOffset { off: off + offset },
-            // This routine is only defined for virtual addressing modes.
-            &MemArg::BXD12 { .. }
-            | &MemArg::BXD20 { .. }
-            | &MemArg::Label { .. }
-            | &MemArg::Symbol { .. } => unreachable!(),
-        }
     }
 
     pub(crate) fn get_flags(&self) -> MemFlags {
@@ -116,10 +106,13 @@ impl MemArg {
             MemArg::BXD20 { flags, .. } => *flags,
             MemArg::RegOffset { flags, .. } => *flags,
             MemArg::Label { .. } => MemFlags::trusted(),
+            MemArg::Constant { .. } => MemFlags::trusted(),
             MemArg::Symbol { flags, .. } => *flags,
             MemArg::InitialSPOffset { .. } => MemFlags::trusted(),
-            MemArg::NominalSPOffset { .. } => MemFlags::trusted(),
+            MemArg::IncomingArgOffset { .. } => MemFlags::trusted(),
+            MemArg::OutgoingArgOffset { .. } => MemFlags::trusted(),
             MemArg::SlotOffset { .. } => MemFlags::trusted(),
+            MemArg::SpillOffset { .. } => MemFlags::trusted(),
         }
     }
 }
@@ -237,13 +230,16 @@ impl PrettyPrint for MemArg {
                 }
             }
             &MemArg::Label { target } => target.to_string(),
+            &MemArg::Constant { constant } => format!("[const({})]", constant.as_u32()),
             &MemArg::Symbol {
                 ref name, offset, ..
             } => format!("{} + {}", name.display(None), offset),
             // Eliminated by `mem_finalize()`.
             &MemArg::InitialSPOffset { .. }
-            | &MemArg::NominalSPOffset { .. }
+            | &MemArg::IncomingArgOffset { .. }
+            | &MemArg::OutgoingArgOffset { .. }
             | &MemArg::SlotOffset { .. }
+            | &MemArg::SpillOffset { .. }
             | &MemArg::RegOffset { .. } => {
                 panic!("Unexpected pseudo mem-arg mode (stack-offset or generic reg-offset)!")
             }

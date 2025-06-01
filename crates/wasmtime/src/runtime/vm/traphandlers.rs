@@ -15,11 +15,11 @@ mod signals;
 #[cfg(all(has_native_signals))]
 pub use self::signals::*;
 
-use crate::prelude::*;
 use crate::runtime::module::lookup_code;
 use crate::runtime::store::{ExecutorRef, StoreOpaque};
 use crate::runtime::vm::sys::traphandlers;
-use crate::runtime::vm::{Instance, InterpreterRef, VMContext, VMStoreContext};
+use crate::runtime::vm::{InterpreterRef, VMContext, VMStoreContext, f32x4, f64x2, i8x16};
+use crate::{EntryStoreContext, prelude::*};
 use crate::{StoreContextMut, WasmBacktrace};
 use core::cell::Cell;
 use core::num::NonZeroU32;
@@ -176,6 +176,11 @@ host_result_no_catch! {
     u32,
     *mut u8,
     u64,
+    f32,
+    f64,
+    i8x16,
+    f32x4,
+    f64x2,
 }
 
 impl HostResult for NonNull<u8> {
@@ -365,13 +370,15 @@ impl From<wasmtime_environ::Trap> for TrapReason {
 /// longjmp'd over and none of its destructors on the stack may be run.
 pub unsafe fn catch_traps<T, F>(
     store: &mut StoreContextMut<'_, T>,
+    old_state: &EntryStoreContext,
     mut closure: F,
 ) -> Result<(), Box<Trap>>
 where
     F: FnMut(NonNull<VMContext>, Option<InterpreterRef<'_>>) -> bool,
 {
     let caller = store.0.default_caller();
-    let result = CallThreadState::new(store.0, caller).with(|cx| match store.0.executor() {
+
+    let result = CallThreadState::new(store.0, old_state).with(|cx| match store.0.executor() {
         // In interpreted mode directly invoke the host closure since we won't
         // be using host-based `setjmp`/`longjmp` as that's not going to save
         // the context we want.
@@ -422,10 +429,30 @@ where
 // usage of its accessor methods.
 mod call_thread_state {
     use super::*;
+    use crate::EntryStoreContext;
     use crate::runtime::vm::Unwind;
 
-    /// Temporary state stored on the stack which is registered in the `tls` module
-    /// below for calls into wasm.
+    /// Temporary state stored on the stack which is registered in the `tls`
+    /// module below for calls into wasm.
+    ///
+    /// This structure is stored on the stack and allocated during the
+    /// `catch_traps` function above. The purpose of this structure is to track
+    /// the state of an "activation" or a sequence of 0-or-more contiguous
+    /// WebAssembly call frames. A `CallThreadState` always lives on the stack
+    /// and additionally maintains pointers to previous states to form a linked
+    /// list of activations.
+    ///
+    /// One of the primary goals of `CallThreadState` is to store the state of
+    /// various fields in `VMStoreContext` when it was created. This is done
+    /// because calling WebAssembly will clobber these fields otherwise.
+    ///
+    /// Another major purpose of `CallThreadState` is to assist with unwinding
+    /// and track state necessary when an unwind happens for the original
+    /// creator of `CallThreadState` to determine why the unwind happened.
+    ///
+    /// Note that this structure is pointed-to from TLS, hence liberal usage of
+    /// interior mutability here since that only gives access to
+    /// `&CallThreadState`.
     pub struct CallThreadState {
         pub(super) unwind: Cell<Option<(UnwindReason, Option<Backtrace>, Option<CoreDumpStack>)>>,
         pub(super) jmp_buf: Cell<*const u8>,
@@ -442,17 +469,15 @@ mod call_thread_state {
         #[cfg(all(has_native_signals, unix))]
         pub(crate) async_guard_range: Range<*mut u8>,
 
-        // The values of `VMStoreContext::last_wasm_{exit_{pc,fp},entry_sp}` for
-        // the *previous* `CallThreadState` for this same store/limits. Our
-        // *current* last wasm PC/FP/SP are saved in `self.vm_store_context`. We
-        // save a copy of the old registers here because the `VMStoreContext`
-        // typically doesn't change across nested calls into Wasm (i.e. they are
-        // typically calls back into the same store and `self.vm_store_context
-        // == self.prev.vm_store_context`) and we must to maintain the list of
-        // contiguous-Wasm-frames stack regions for backtracing purposes.
-        old_last_wasm_exit_fp: Cell<usize>,
-        old_last_wasm_exit_pc: Cell<usize>,
-        old_last_wasm_entry_fp: Cell<usize>,
+        // The state of the runtime for the *previous* `CallThreadState` for
+        // this same store. Our *current* state is saved in `self.vm_store_context`,
+        // etc. We need access to the old values of these
+        // fields because the `VMStoreContext` typically doesn't change across
+        // nested calls into Wasm (i.e. they are typically calls back into the
+        // same store and `self.vm_store_context == self.prev.vm_store_context`) and we must to
+        // maintain the list of contiguous-Wasm-frames stack regions for
+        // backtracing purposes.
+        old_state: *const EntryStoreContext,
     }
 
     impl Drop for CallThreadState {
@@ -460,13 +485,6 @@ mod call_thread_state {
             // Unwind information should not be present as it should have
             // already been processed.
             debug_assert!(self.unwind.replace(None).is_none());
-
-            unsafe {
-                let cx = self.vm_store_context.as_ref();
-                *cx.last_wasm_exit_fp.get() = self.old_last_wasm_exit_fp.get();
-                *cx.last_wasm_exit_pc.get() = self.old_last_wasm_exit_pc.get();
-                *cx.last_wasm_entry_fp.get() = self.old_last_wasm_entry_fp.get();
-            }
         }
     }
 
@@ -474,14 +492,10 @@ mod call_thread_state {
         pub const JMP_BUF_INTERPRETER_SENTINEL: *mut u8 = 1 as *mut u8;
 
         #[inline]
-        pub(super) fn new(store: &mut StoreOpaque, caller: NonNull<VMContext>) -> CallThreadState {
-            let vm_store_context = unsafe {
-                Instance::from_vmctx(caller, |i| i.vm_store_context())
-                    .read()
-                    .unwrap()
-                    .as_non_null()
-            };
-
+        pub(super) fn new(
+            store: &mut StoreOpaque,
+            old_state: *const EntryStoreContext,
+        ) -> CallThreadState {
             // Don't try to plumb #[cfg] everywhere for this field, just pretend
             // we're using it on miri/windows to silence compiler warnings.
             let _: Range<_> = store.async_guard_range();
@@ -495,35 +509,27 @@ mod call_thread_state {
                 capture_backtrace: store.engine().config().wasm_backtrace,
                 #[cfg(feature = "coredump")]
                 capture_coredump: store.engine().config().coredump_on_trap,
-                vm_store_context,
+                vm_store_context: store.vm_store_context_ptr(),
                 #[cfg(all(has_native_signals, unix))]
                 async_guard_range: store.async_guard_range(),
                 prev: Cell::new(ptr::null()),
-                old_last_wasm_exit_fp: Cell::new(unsafe {
-                    *vm_store_context.as_ref().last_wasm_exit_fp.get()
-                }),
-                old_last_wasm_exit_pc: Cell::new(unsafe {
-                    *vm_store_context.as_ref().last_wasm_exit_pc.get()
-                }),
-                old_last_wasm_entry_fp: Cell::new(unsafe {
-                    *vm_store_context.as_ref().last_wasm_entry_fp.get()
-                }),
+                old_state,
             }
         }
 
         /// Get the saved FP upon exit from Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_exit_fp(&self) -> usize {
-            self.old_last_wasm_exit_fp.get()
+        pub unsafe fn old_last_wasm_exit_fp(&self) -> usize {
+            (&*self.old_state).last_wasm_exit_fp
         }
 
         /// Get the saved PC upon exit from Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_exit_pc(&self) -> usize {
-            self.old_last_wasm_exit_pc.get()
+        pub unsafe fn old_last_wasm_exit_pc(&self) -> usize {
+            (&*self.old_state).last_wasm_exit_pc
         }
 
         /// Get the saved FP upon entry into Wasm for the previous `CallThreadState`.
-        pub fn old_last_wasm_entry_fp(&self) -> usize {
-            self.old_last_wasm_entry_fp.get()
+        pub unsafe fn old_last_wasm_entry_fp(&self) -> usize {
+            (&*self.old_state).last_wasm_entry_fp
         }
 
         /// Get the previous `CallThreadState`.
@@ -531,12 +537,31 @@ mod call_thread_state {
             self.prev.get()
         }
 
+        /// Pushes this `CallThreadState` activation on to the linked list
+        /// stored in TLS.
+        ///
+        /// This method will take the current head of the linked list, stored in
+        /// our TLS pointer, and move it into `prev`. The TLS pointer is then
+        /// updated to `self`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if this activation is already in a linked list (e.g.
+        /// `self.prev` is set).
         #[inline]
         pub(crate) unsafe fn push(&self) {
             assert!(self.prev.get().is_null());
             self.prev.set(tls::raw::replace(self));
         }
 
+        /// Pops this `CallThreadState` from the linked list stored in TLS.
+        ///
+        /// This method will restore `self.prev` into the head of the linked
+        /// list stored in TLS and will additionally null-out `self.prev`.
+        ///
+        /// # Panics
+        ///
+        /// Panics if this activation isn't the head of the list.
         #[inline]
         pub(crate) unsafe fn pop(&self) {
             let prev = self.prev.replace(ptr::null());
@@ -606,10 +631,13 @@ impl CallThreadState {
             {
                 (None, None)
             }
-            UnwindReason::Trap(_) => (
-                self.capture_backtrace(self.vm_store_context.as_ptr(), None),
-                self.capture_coredump(self.vm_store_context.as_ptr(), None),
-            ),
+            UnwindReason::Trap(trap) => {
+                log::trace!("Capturing backtrace and coredump for {trap:?}");
+                (
+                    self.capture_backtrace(self.vm_store_context.as_ptr(), None),
+                    self.capture_coredump(self.vm_store_context.as_ptr(), None),
+                )
+            }
         };
         self.unwind.set(Some((reason, backtrace, coredump)));
     }
@@ -740,11 +768,84 @@ impl CallThreadState {
     }
 }
 
-// A private inner module for managing the TLS state that we require across
-// calls in wasm. The WebAssembly code is called from C++ and then a trap may
-// happen which requires us to read some contextual state to figure out what to
-// do with the trap. This `tls` module is used to persist that information from
-// the caller to the trap site.
+/// A private inner module managing the state of Wasmtime's thread-local storage
+/// (TLS) state.
+///
+/// Wasmtime at this time has a single pointer of TLS. This single pointer of
+/// TLS is the totality of all TLS required by Wasmtime. By keeping this as
+/// small as possible it generally makes it easier to integrate with external
+/// systems and implement features such as fiber context switches. This single
+/// TLS pointer is declared in platform-specific modules to handle platform
+/// differences, so this module here uses getters/setters which delegate to
+/// platform-specific implementations.
+///
+/// The single TLS pointer used by Wasmtime is morally
+/// `Option<&CallThreadState>` meaning that it's a possibly-present pointer to
+/// some state. This pointer is a pointer to the most recent (youngest)
+/// `CallThreadState` activation, or the most recent call into WebAssembly.
+///
+/// This TLS pointer is additionally the head of a linked list of activations
+/// that are all stored on the stack for the current thread. Each time
+/// WebAssembly is recursively invoked by an embedder will push a new entry into
+/// this linked list. This singly-linked list is maintained with its head in TLS
+/// node pointers are stored in `CallThreadState::prev`.
+///
+/// An example stack might look like this:
+///
+/// ```text
+/// ┌─────────────────────┐◄───── highest, or oldest, stack address
+/// │ native stack frames │
+/// │         ...         │
+/// │  ┌───────────────┐◄─┼──┐
+/// │  │CallThreadState│  │  │
+/// │  └───────────────┘  │  p
+/// ├─────────────────────┤  r
+/// │  wasm stack frames  │  e
+/// │         ...         │  v
+/// ├─────────────────────┤  │
+/// │ native stack frames │  │
+/// │         ...         │  │
+/// │  ┌───────────────┐◄─┼──┼── TLS pointer
+/// │  │CallThreadState├──┼──┘
+/// │  └───────────────┘  │
+/// ├─────────────────────┤
+/// │  wasm stack frames  │
+/// │         ...         │
+/// ├─────────────────────┤
+/// │ native stack frames │
+/// │         ...         │
+/// └─────────────────────┘◄───── smallest, or youngest, stack address
+/// ```
+///
+/// # Fibers and async
+///
+/// Wasmtime supports stack-switching with fibers to implement async. This means
+/// that Wasmtime will temporarily execute code on a separate stack and then
+/// suspend from this stack back to the embedder for async operations. Doing
+/// this safely requires manual management of the TLS pointer updated by
+/// Wasmtime.
+///
+/// For example when a fiber is suspended that means that the TLS pointer needs
+/// to be restored to whatever it was when the fiber was resumed. Additionally
+/// this may need to pop multiple `CallThreadState` activations, one for each
+/// one located on the fiber stack itself.
+///
+/// The `AsyncWasmCallState` and `PreviousAsyncWasmCallState` structures in this
+/// module are used to manage this state, namely:
+///
+/// * The `AsyncWasmCallState` structure represents the state of a suspended
+///   fiber. This is a linked list, in reverse order, from oldest activation on
+///   the fiber to youngest activation on the fiber.
+///
+/// * The `PreviousAsyncWasmCallState` structure represents a pointer within our
+///   thread's TLS linked list of activations when a fiber was resumed. This
+///   pointer is used during fiber suspension to know when to stop popping
+///   activations from the thread's linked list.
+///
+/// Note that this means that the directionality of linked list links is
+/// opposite when stored in TLS vs when stored for a suspended fiber. The
+/// thread's current list pointed to by TLS is youngest-to-oldest links, while a
+/// suspended fiber stores oldest-to-youngest links.
 pub(crate) mod tls {
     use super::CallThreadState;
 
@@ -766,7 +867,6 @@ pub(crate) mod tls {
     // these functions are free to be inlined.
     pub(super) mod raw {
         use super::CallThreadState;
-        use sptr::Strict;
 
         pub type Ptr = *const CallThreadState;
 
@@ -776,7 +876,7 @@ pub(crate) mod tls {
 
         fn tls_get() -> (Ptr, bool) {
             let mut initialized = false;
-            let p = Strict::map_addr(crate::runtime::vm::sys::tls_get(), |a| {
+            let p = crate::runtime::vm::sys::tls_get().map_addr(|a| {
                 initialized = (a & 1) != 0;
                 a & !1
             });
@@ -784,7 +884,7 @@ pub(crate) mod tls {
         }
 
         fn tls_set(ptr: Ptr, initialized: bool) {
-            let encoded = Strict::map_addr(ptr, |a| a | usize::from(initialized));
+            let encoded = ptr.map_addr(|a| a | usize::from(initialized));
             crate::runtime::vm::sys::tls_set(encoded.cast_mut().cast::<u8>());
         }
 
@@ -836,6 +936,9 @@ pub(crate) mod tls {
         //
         // When pushed onto a thread this linked list is traversed to get pushed
         // onto the current thread at the time.
+        //
+        // If this pointer is null then that means that the fiber this state is
+        // associated with has no activations.
         state: raw::Ptr,
     }
 
@@ -889,7 +992,7 @@ pub(crate) mod tls {
         ///
         /// This is used when exiting a future in Wasmtime to assert that the
         /// current CallThreadState pointer does not point within the stack
-        /// we're leaving (e.g.  allocated for a fiber).
+        /// we're leaving (e.g. allocated for a fiber).
         pub fn assert_current_state_not_in_range(range: core::ops::Range<usize>) {
             let p = raw::get() as usize;
             assert!(p < range.start || range.end < p);
@@ -898,14 +1001,15 @@ pub(crate) mod tls {
 
     /// Opaque state used to help control TLS state across stack switches for
     /// async support.
+    ///
+    /// This structure is returned from [`AsyncWasmCallState::push`] and
+    /// represents the state of this thread's TLS variable prior to the push
+    /// operation.
     #[cfg(feature = "async")]
     pub struct PreviousAsyncWasmCallState {
-        // The head of a linked list, similar to the TLS state. Note though that
-        // this list is stored in reverse order to assist with `push` and `pop`
-        // below.
-        //
-        // After a `push` call this stores the previous head for the current
-        // thread so we know when to stop popping during a `pop`.
+        // The raw value of this thread's TLS pointer when this structure was
+        // created. This is not dereferenced or inspected but is used to halt
+        // linked list traversal in [`PreviousAsyncWasmCallState::restore`].
         state: raw::Ptr,
     }
 
@@ -915,8 +1019,8 @@ pub(crate) mod tls {
         /// `AsyncWasmCallState`.
         ///
         /// This will pop the top activation of this current thread continuously
-        /// until it reaches whatever the current activation was when `push` was
-        /// originally called.
+        /// until it reaches whatever the current activation was when
+        /// [`AsyncWasmCallState::push`] was originally called.
         ///
         /// # Unsafety
         ///

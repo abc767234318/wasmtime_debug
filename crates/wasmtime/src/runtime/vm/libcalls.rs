@@ -55,11 +55,13 @@
 //! ```
 
 use crate::prelude::*;
-use crate::runtime::vm::table::{Table, TableElementType};
-use crate::runtime::vm::vmcontext::VMFuncRef;
 #[cfg(feature = "gc")]
 use crate::runtime::vm::VMGcRef;
-use crate::runtime::vm::{HostResultHasUnwindSentinel, Instance, TrapReason, VMStore};
+use crate::runtime::vm::table::{Table, TableElementType};
+use crate::runtime::vm::vmcontext::VMFuncRef;
+use crate::runtime::vm::{
+    HostResultHasUnwindSentinel, Instance, TrapReason, VMStore, f32x4, f64x2, i8x16,
+};
 use core::convert::Infallible;
 use core::ptr::NonNull;
 #[cfg(feature = "threads")]
@@ -92,7 +94,7 @@ pub mod raw {
     // between doc comments and `cfg`s.
     #![allow(unused_doc_comments, unused_attributes)]
 
-    use crate::runtime::vm::{InstanceAndStore, VMContext};
+    use crate::runtime::vm::{InstanceAndStore, VMContext, f32x4, f64x2, i8x16};
     use core::ptr::NonNull;
 
     macro_rules! libcall {
@@ -109,7 +111,10 @@ pub mod raw {
                 // This will delegate to the outer module to the actual
                 // implementation and automatically perform `catch_unwind` along
                 // with conversion of the return value in the face of traps.
+                //
+                // Ignore improper ctypes to permit `__m128i` on x86_64.
                 #[allow(unused_variables, missing_docs)]
+                #[allow(improper_ctypes_definitions)]
                 pub unsafe extern "C" fn $name(
                     vmctx: NonNull<VMContext>,
                     $( $pname : libcall!(@ty $param), )*
@@ -132,9 +137,12 @@ pub mod raw {
                 // This works around a `rustc` bug where compiling with LTO
                 // will sometimes strip out some of these symbols resulting
                 // in a linking failure.
+                //
+                // Ignore improper ctypes to permit `__m128i` on x86_64.
                 #[allow(non_upper_case_globals)]
                 const _: () = {
                     #[used]
+                    #[allow(improper_ctypes_definitions)]
                     static I_AM_USED: unsafe extern "C" fn(
                         NonNull<VMContext>,
                         $( $pname : libcall!(@ty $param), )*
@@ -145,7 +153,12 @@ pub mod raw {
 
         (@ty u32) => (u32);
         (@ty u64) => (u64);
+        (@ty f32) => (f32);
+        (@ty f64) => (f64);
         (@ty u8) => (u8);
+        (@ty i8x16) => (i8x16);
+        (@ty f32x4) => (f32x4);
+        (@ty f64x2) => (f64x2);
         (@ty bool) => (bool);
         (@ty pointer) => (*mut u8);
     }
@@ -270,7 +283,7 @@ unsafe fn table_fill_func_ref(
     match table.element_type() {
         TableElementType::Func => {
             let val = NonNull::new(val.cast::<VMFuncRef>());
-            table.fill(store.optional_gc_store_mut()?, dst, val.into(), len)?;
+            table.fill(store.optional_gc_store_mut(), dst, val.into(), len)?;
             Ok(())
         }
         TableElementType::GcRef => unreachable!(),
@@ -317,7 +330,7 @@ unsafe fn table_copy(
     // Lazy-initialize the whole range in the source table first.
     let src_range = src..(src.checked_add(len).unwrap_or(u64::MAX));
     let src_table = instance.get_table_with_lazy_init(src_table_index, src_range);
-    let gc_store = store.optional_gc_store_mut()?;
+    let gc_store = store.optional_gc_store_mut();
     Table::copy(gc_store, dst_table, src_table, dst, src, len)?;
     Ok(())
 }
@@ -438,6 +451,33 @@ unsafe fn drop_gc_ref(store: &mut dyn VMStore, _instance: &mut Instance, gc_ref:
         .drop_gc_ref(gc_ref);
 }
 
+/// Grow the GC heap.
+#[cfg(feature = "gc-null")]
+unsafe fn grow_gc_heap(
+    store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    bytes_needed: u64,
+) -> Result<()> {
+    let orig_len = u64::try_from(store.gc_store()?.gc_heap.vmmemory().current_length()).unwrap();
+
+    store
+        .maybe_async_gc(None, Some(bytes_needed))
+        .context("failed to grow the GC heap")
+        .context(crate::Trap::AllocationTooLarge)?;
+
+    // JIT code relies on the memory having grown by `bytes_needed` bytes if
+    // this libcall returns successfully, so trap if we didn't grow that much.
+    let new_len = u64::try_from(store.gc_store()?.gc_heap.vmmemory().current_length()).unwrap();
+    if orig_len
+        .checked_add(bytes_needed)
+        .is_none_or(|expected_len| new_len < expected_len)
+    {
+        return Err(crate::Trap::AllocationTooLarge.into());
+    }
+
+    Ok(())
+}
+
 /// Do a GC, keeping `gc_ref` rooted and returning the updated `gc_ref`
 /// reference.
 #[cfg(feature = "gc-drc")]
@@ -463,7 +503,7 @@ unsafe fn gc(store: &mut dyn VMStore, _instance: &mut Instance, gc_ref: u32) -> 
         let _ = gc_store.expose_gc_ref_to_wasm(gc_ref);
     }
 
-    match store.maybe_async_gc(gc_ref)? {
+    match store.maybe_async_grow_or_collect_gc_heap(gc_ref, None)? {
         None => Ok(0),
         Some(r) => {
             let raw = store
@@ -487,12 +527,12 @@ unsafe fn gc_alloc_raw(
     size: u32,
     align: u32,
 ) -> Result<core::num::NonZeroU32> {
-    use crate::{vm::VMGcHeader, GcHeapOutOfMemory};
+    use crate::vm::VMGcHeader;
     use core::alloc::Layout;
     use wasmtime_environ::{ModuleInternedTypeIndex, VMGcKind};
 
     let kind = VMGcKind::from_high_bits_of_u32(kind_and_reserved);
-    log::trace!("gc_alloc_raw(kind={kind:?}, size={size}, align={align})",);
+    log::trace!("gc_alloc_raw(kind={kind:?}, size={size}, align={align})");
 
     let module = instance
         .runtime_module()
@@ -515,29 +555,17 @@ unsafe fn gc_alloc_raw(
         err.context(e)
     })?;
 
-    let gc_ref = match store
-        .store_opaque_mut()
-        .unwrap_gc_store_mut()
-        .alloc_raw(header, layout)?
-    {
-        Some(r) => r,
-        None => {
-            // If the allocation failed, do a GC to hopefully clean up space.
-            store.maybe_async_gc(None)?;
-
-            // And then try again.
+    let store = store.store_opaque_mut();
+    let gc_ref = unsafe {
+        store.retry_after_gc_maybe_async((), |store, ()| {
             store
                 .unwrap_gc_store_mut()
                 .alloc_raw(header, layout)?
-                .ok_or_else(|| GcHeapOutOfMemory::new(()))?
-        }
+                .map_err(|bytes_needed| crate::GcHeapOutOfMemory::new((), bytes_needed).into())
+        })?
     };
 
-    let raw = store
-        .store_opaque_mut()
-        .unwrap_gc_store_mut()
-        .expose_gc_ref_to_wasm(gc_ref);
-
+    let raw = store.unwrap_gc_store_mut().expose_gc_ref_to_wasm(gc_ref);
     Ok(raw)
 }
 
@@ -575,7 +603,7 @@ unsafe fn get_interned_func_ref(
 ) -> *mut u8 {
     use super::FuncRefTableId;
     use crate::store::AutoAssertNoGc;
-    use wasmtime_environ::{packed_option::ReservedValue, ModuleInternedTypeIndex};
+    use wasmtime_environ::{ModuleInternedTypeIndex, packed_option::ReservedValue};
 
     let store = AutoAssertNoGc::new(store.store_opaque_mut());
 
@@ -609,9 +637,10 @@ unsafe fn array_new_data(
     src: u32,
     len: u32,
 ) -> Result<core::num::NonZeroU32> {
-    use crate::{ArrayType, GcHeapOutOfMemory};
+    use crate::ArrayType;
     use wasmtime_environ::ModuleInternedTypeIndex;
 
+    let store = store.store_opaque_mut();
     let array_type_index = ModuleInternedTypeIndex::from_u32(array_type_index);
     let data_index = DataIndex::from_u32(data_index);
 
@@ -619,7 +648,7 @@ unsafe fn array_new_data(
     // of the array).
     let data_range = instance.wasm_data_range(data_index);
     let shared_ty = instance.engine_type_index(array_type_index);
-    let array_ty = ArrayType::from_shared_type_index(store.store_opaque_mut().engine(), shared_ty);
+    let array_ty = ArrayType::from_shared_type_index(store.engine(), shared_ty);
     let one_elem_size = array_ty
         .element_type()
         .data_byte_size()
@@ -639,40 +668,26 @@ unsafe fn array_new_data(
 
     // Allocate the (uninitialized) array.
     let gc_layout = store
-        .store_opaque_mut()
         .engine()
         .signatures()
         .layout(shared_ty)
         .expect("array types have GC layouts");
     let array_layout = gc_layout.unwrap_array();
-    let array_ref = match store
-        .store_opaque_mut()
-        .unwrap_gc_store_mut()
-        .alloc_uninit_array(shared_ty, len, &array_layout)?
-    {
-        Some(a) => a,
-        None => {
-            // Collect garbage to hopefully free up space, then try the
-            // allocation again.
-            store.maybe_async_gc(None)?;
-            store
-                .store_opaque_mut()
-                .unwrap_gc_store_mut()
-                .alloc_uninit_array(shared_ty, u32::try_from(byte_len).unwrap(), &array_layout)?
-                .ok_or_else(|| GcHeapOutOfMemory::new(()))?
-        }
-    };
+    let array_ref = store.retry_after_gc_maybe_async((), |store, ()| {
+        store
+            .unwrap_gc_store_mut()
+            .alloc_uninit_array(shared_ty, len, &array_layout)?
+            .map_err(|bytes_needed| crate::GcHeapOutOfMemory::new((), bytes_needed).into())
+    })?;
 
     // Copy the data into the array, initializing it.
     store
-        .store_opaque_mut()
         .unwrap_gc_store_mut()
         .gc_object_data(array_ref.as_gc_ref())
         .copy_from_slice(array_layout.base_size, data);
 
     // Return the array to Wasm!
     let raw = store
-        .store_opaque_mut()
         .unwrap_gc_store_mut()
         .expose_gc_ref_to_wasm(array_ref.into());
     Ok(raw)
@@ -770,9 +785,9 @@ unsafe fn array_new_elem(
     len: u32,
 ) -> Result<core::num::NonZeroU32> {
     use crate::{
+        ArrayRef, ArrayRefPre, ArrayType, Func, RootSet, RootedGcRefImpl, Val,
         store::AutoAssertNoGc,
         vm::const_expr::{ConstEvalContext, ConstExprEvaluator},
-        ArrayRef, ArrayRefPre, ArrayType, Func, GcHeapOutOfMemory, RootSet, RootedGcRefImpl, Val,
     };
     use wasmtime_environ::{ModuleInternedTypeIndex, TableSegmentElements};
 
@@ -827,16 +842,7 @@ unsafe fn array_new_elem(
             }
         }
 
-        let array = match ArrayRef::_new_fixed(store, &pre, &vals) {
-            Ok(a) => a,
-            Err(e) if e.is::<GcHeapOutOfMemory<()>>() => {
-                // Collect garbage to hopefully free up space, then try the
-                // allocation again.
-                store.maybe_async_gc(None)?;
-                ArrayRef::_new_fixed(store, &pre, &vals)?
-            }
-            Err(e) => return Err(e),
-        };
+        let array = unsafe { ArrayRef::new_fixed_maybe_async(store, &pre, &vals)? };
 
         let mut store = AutoAssertNoGc::new(store);
         let gc_ref = array.try_clone_gc_ref(&mut store)?;
@@ -857,9 +863,9 @@ unsafe fn array_init_elem(
     len: u32,
 ) -> Result<()> {
     use crate::{
+        ArrayRef, Func, OpaqueRootScope, Val,
         store::AutoAssertNoGc,
         vm::const_expr::{ConstEvalContext, ConstExprEvaluator},
-        ArrayRef, Func, OpaqueRootScope, Val,
     };
     use wasmtime_environ::{ModuleInternedTypeIndex, TableSegmentElements};
 
@@ -870,8 +876,8 @@ unsafe fn array_init_elem(
     let elem_index = ElemIndex::from_u32(elem_index);
 
     log::trace!(
-            "array.init_elem(array={array:#x}, dst={dst}, elem_index={elem_index:?}, src={src}, len={len})",
-        );
+        "array.init_elem(array={array:#x}, dst={dst}, elem_index={elem_index:?}, src={src}, len={len})",
+    );
 
     // Convert the raw GC ref into a `Rooted<ArrayRef>`.
     let array = VMGcRef::from_raw_u32(array).ok_or_else(|| Trap::NullReference)?;
@@ -955,11 +961,11 @@ unsafe fn array_copy(
     src: u32,
     len: u32,
 ) -> Result<()> {
-    use crate::{store::AutoAssertNoGc, ArrayRef, OpaqueRootScope};
+    use crate::{ArrayRef, OpaqueRootScope, store::AutoAssertNoGc};
 
     log::trace!(
-            "array.copy(dst_array={dst_array:#x}, dst_index={dst}, src_array={src_array:#x}, src_index={src}, len={len})",
-        );
+        "array.copy(dst_array={dst_array:#x}, dst_index={dst}, src_array={src_array:#x}, src_index={src}, len={len})",
+    );
 
     let mut store = OpaqueRootScope::new(store.store_opaque_mut());
     let mut store = AutoAssertNoGc::new(&mut store);
@@ -1018,11 +1024,7 @@ unsafe fn is_subtype(
     let actual = VMSharedTypeIndex::from_u32(actual_engine_type);
     let expected = VMSharedTypeIndex::from_u32(expected_engine_type);
 
-    let is_subtype: bool = store
-        .engine()
-        .signatures()
-        .is_subtype(actual, expected)
-        .into();
+    let is_subtype: bool = store.engine().signatures().is_subtype(actual, expected);
 
     log::trace!("is_subtype(actual={actual:?}, expected={expected:?}) -> {is_subtype}",);
     is_subtype as u32
@@ -1235,6 +1237,215 @@ fn update_mem_size(_store: &mut dyn VMStore, instance: &mut Instance, num_pages:
     }
 }
 
+fn floor_f32(_store: &mut dyn VMStore, _instance: &mut Instance, val: f32) -> f32 {
+    wasmtime_math::WasmFloat::wasm_floor(val)
+}
+
+fn floor_f64(_store: &mut dyn VMStore, _instance: &mut Instance, val: f64) -> f64 {
+    wasmtime_math::WasmFloat::wasm_floor(val)
+}
+
+fn ceil_f32(_store: &mut dyn VMStore, _instance: &mut Instance, val: f32) -> f32 {
+    wasmtime_math::WasmFloat::wasm_ceil(val)
+}
+
+fn ceil_f64(_store: &mut dyn VMStore, _instance: &mut Instance, val: f64) -> f64 {
+    wasmtime_math::WasmFloat::wasm_ceil(val)
+}
+
+fn trunc_f32(_store: &mut dyn VMStore, _instance: &mut Instance, val: f32) -> f32 {
+    wasmtime_math::WasmFloat::wasm_trunc(val)
+}
+
+fn trunc_f64(_store: &mut dyn VMStore, _instance: &mut Instance, val: f64) -> f64 {
+    wasmtime_math::WasmFloat::wasm_trunc(val)
+}
+
+fn nearest_f32(_store: &mut dyn VMStore, _instance: &mut Instance, val: f32) -> f32 {
+    wasmtime_math::WasmFloat::wasm_nearest(val)
+}
+
+fn nearest_f64(_store: &mut dyn VMStore, _instance: &mut Instance, val: f64) -> f64 {
+    wasmtime_math::WasmFloat::wasm_nearest(val)
+}
+
+// This intrinsic is only used on x86_64 platforms as an implementation of
+// the `i8x16.swizzle` instruction when `pshufb` in SSSE3 is not available.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+fn i8x16_swizzle(_store: &mut dyn VMStore, _instance: &mut Instance, a: i8x16, b: i8x16) -> i8x16 {
+    union U {
+        reg: i8x16,
+        mem: [u8; 16],
+    }
+
+    unsafe {
+        let a = U { reg: a }.mem;
+        let b = U { reg: b }.mem;
+
+        // Use the `swizzle` semantics of returning 0 on any out-of-bounds
+        // index, rather than the x86 pshufb semantics, since Wasmtime uses
+        // this to implement `i8x16.swizzle`.
+        let select = |arr: &[u8; 16], byte: u8| {
+            if byte >= 16 { 0x00 } else { arr[byte as usize] }
+        };
+
+        U {
+            mem: [
+                select(&a, b[0]),
+                select(&a, b[1]),
+                select(&a, b[2]),
+                select(&a, b[3]),
+                select(&a, b[4]),
+                select(&a, b[5]),
+                select(&a, b[6]),
+                select(&a, b[7]),
+                select(&a, b[8]),
+                select(&a, b[9]),
+                select(&a, b[10]),
+                select(&a, b[11]),
+                select(&a, b[12]),
+                select(&a, b[13]),
+                select(&a, b[14]),
+                select(&a, b[15]),
+            ],
+        }
+        .reg
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+fn i8x16_swizzle(
+    _store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    _a: i8x16,
+    _b: i8x16,
+) -> i8x16 {
+    unreachable!()
+}
+
+// This intrinsic is only used on x86_64 platforms as an implementation of
+// the `i8x16.shuffle` instruction when `pshufb` in SSSE3 is not available.
+#[cfg(all(target_arch = "x86_64", target_feature = "sse"))]
+fn i8x16_shuffle(
+    _store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    a: i8x16,
+    b: i8x16,
+    c: i8x16,
+) -> i8x16 {
+    union U {
+        reg: i8x16,
+        mem: [u8; 16],
+    }
+
+    unsafe {
+        let ab = [U { reg: a }.mem, U { reg: b }.mem];
+        let c = U { reg: c }.mem;
+
+        // Use the `shuffle` semantics of returning 0 on any out-of-bounds
+        // index, rather than the x86 pshufb semantics, since Wasmtime uses
+        // this to implement `i8x16.shuffle`.
+        let select = |arr: &[[u8; 16]; 2], byte: u8| {
+            if byte >= 32 {
+                0x00
+            } else if byte >= 16 {
+                arr[1][byte as usize - 16]
+            } else {
+                arr[0][byte as usize]
+            }
+        };
+
+        U {
+            mem: [
+                select(&ab, c[0]),
+                select(&ab, c[1]),
+                select(&ab, c[2]),
+                select(&ab, c[3]),
+                select(&ab, c[4]),
+                select(&ab, c[5]),
+                select(&ab, c[6]),
+                select(&ab, c[7]),
+                select(&ab, c[8]),
+                select(&ab, c[9]),
+                select(&ab, c[10]),
+                select(&ab, c[11]),
+                select(&ab, c[12]),
+                select(&ab, c[13]),
+                select(&ab, c[14]),
+                select(&ab, c[15]),
+            ],
+        }
+        .reg
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "sse")))]
+fn i8x16_shuffle(
+    _store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    _a: i8x16,
+    _b: i8x16,
+    _c: i8x16,
+) -> i8x16 {
+    unreachable!()
+}
+
+fn fma_f32x4(
+    _store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    x: f32x4,
+    y: f32x4,
+    z: f32x4,
+) -> f32x4 {
+    union U {
+        reg: f32x4,
+        mem: [f32; 4],
+    }
+
+    unsafe {
+        let x = U { reg: x }.mem;
+        let y = U { reg: y }.mem;
+        let z = U { reg: z }.mem;
+
+        U {
+            mem: [
+                wasmtime_math::WasmFloat::wasm_mul_add(x[0], y[0], z[0]),
+                wasmtime_math::WasmFloat::wasm_mul_add(x[1], y[1], z[1]),
+                wasmtime_math::WasmFloat::wasm_mul_add(x[2], y[2], z[2]),
+                wasmtime_math::WasmFloat::wasm_mul_add(x[3], y[3], z[3]),
+            ],
+        }
+        .reg
+    }
+}
+
+fn fma_f64x2(
+    _store: &mut dyn VMStore,
+    _instance: &mut Instance,
+    x: f64x2,
+    y: f64x2,
+    z: f64x2,
+) -> f64x2 {
+    union U {
+        reg: f64x2,
+        mem: [f64; 2],
+    }
+
+    unsafe {
+        let x = U { reg: x }.mem;
+        let y = U { reg: y }.mem;
+        let z = U { reg: z }.mem;
+
+        U {
+            mem: [
+                wasmtime_math::WasmFloat::wasm_mul_add(x[0], y[0], z[0]),
+                wasmtime_math::WasmFloat::wasm_mul_add(x[1], y[1], z[1]),
+            ],
+        }
+        .reg
+    }
+}
+
 /// This intrinsic is just used to record trap information.
 ///
 /// The `Infallible` "ok" type here means that this never returns success, it
@@ -1263,104 +1474,4 @@ fn raise(_store: &mut dyn VMStore, _instance: &mut Instance) {
     // just insert a stub to catch bugs if it's accidentally called.
     #[cfg(not(has_host_compiler_backend))]
     unreachable!()
-}
-
-/// This module contains functions which are used for resolving relocations at
-/// runtime if necessary.
-///
-/// These functions are not used by default and currently the only platform
-/// they're used for is on x86_64 when SIMD is disabled and then SSE features
-/// are further disabled. In these configurations Cranelift isn't allowed to use
-/// native CPU instructions so it falls back to libcalls and we rely on the Rust
-/// standard library generally for implementing these.
-#[allow(missing_docs)]
-pub mod relocs {
-    pub extern "C" fn floorf32(f: f32) -> f32 {
-        wasmtime_math::WasmFloat::wasm_floor(f)
-    }
-
-    pub extern "C" fn floorf64(f: f64) -> f64 {
-        wasmtime_math::WasmFloat::wasm_floor(f)
-    }
-
-    pub extern "C" fn ceilf32(f: f32) -> f32 {
-        wasmtime_math::WasmFloat::wasm_ceil(f)
-    }
-
-    pub extern "C" fn ceilf64(f: f64) -> f64 {
-        wasmtime_math::WasmFloat::wasm_ceil(f)
-    }
-
-    pub extern "C" fn truncf32(f: f32) -> f32 {
-        wasmtime_math::WasmFloat::wasm_trunc(f)
-    }
-
-    pub extern "C" fn truncf64(f: f64) -> f64 {
-        wasmtime_math::WasmFloat::wasm_trunc(f)
-    }
-
-    pub extern "C" fn nearestf32(x: f32) -> f32 {
-        wasmtime_math::WasmFloat::wasm_nearest(x)
-    }
-
-    pub extern "C" fn nearestf64(x: f64) -> f64 {
-        wasmtime_math::WasmFloat::wasm_nearest(x)
-    }
-
-    pub extern "C" fn fmaf32(a: f32, b: f32, c: f32) -> f32 {
-        wasmtime_math::WasmFloat::wasm_mul_add(a, b, c)
-    }
-
-    pub extern "C" fn fmaf64(a: f64, b: f64, c: f64) -> f64 {
-        wasmtime_math::WasmFloat::wasm_mul_add(a, b, c)
-    }
-
-    // This intrinsic is only used on x86_64 platforms as an implementation of
-    // the `pshufb` instruction when SSSE3 is not available.
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::__m128i;
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "sse")]
-    #[allow(improper_ctypes_definitions)]
-    pub unsafe extern "C" fn x86_pshufb(a: __m128i, b: __m128i) -> __m128i {
-        union U {
-            reg: __m128i,
-            mem: [u8; 16],
-        }
-
-        unsafe {
-            let a = U { reg: a }.mem;
-            let b = U { reg: b }.mem;
-
-            let select = |arr: &[u8; 16], byte: u8| {
-                if byte & 0x80 != 0 {
-                    0x00
-                } else {
-                    arr[(byte & 0xf) as usize]
-                }
-            };
-
-            U {
-                mem: [
-                    select(&a, b[0]),
-                    select(&a, b[1]),
-                    select(&a, b[2]),
-                    select(&a, b[3]),
-                    select(&a, b[4]),
-                    select(&a, b[5]),
-                    select(&a, b[6]),
-                    select(&a, b[7]),
-                    select(&a, b[8]),
-                    select(&a, b[9]),
-                    select(&a, b[10]),
-                    select(&a, b[11]),
-                    select(&a, b[12]),
-                    select(&a, b[13]),
-                    select(&a, b[14]),
-                    select(&a, b[15]),
-                ],
-            }
-            .reg
-        }
-    }
 }

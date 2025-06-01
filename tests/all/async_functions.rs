@@ -4,7 +4,7 @@ use anyhow::{anyhow, bail};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use std::task::{Context, Poll, Waker};
 use wasmtime::*;
 
 fn async_store() -> Store<()> {
@@ -206,7 +206,7 @@ async fn suspend_while_suspending() {
             let mut future = Box::pin(async_thunk.call_async(&mut caller, &[], &mut []));
             let poll = future
                 .as_mut()
-                .poll(&mut Context::from_waker(&noop_waker()));
+                .poll(&mut Context::from_waker(Waker::noop()));
             assert!(poll.is_ready());
             Ok(())
         });
@@ -593,7 +593,7 @@ async fn resume_separate_thread3() {
         let mut future = Box::pin(f);
         let poll = future
             .as_mut()
-            .poll(&mut Context::from_waker(&noop_waker()));
+            .poll(&mut Context::from_waker(Waker::noop()));
         assert!(poll.is_pending());
 
         // ... so at this point our call into wasm is suspended. The call into
@@ -780,13 +780,6 @@ where
     }
 }
 
-fn noop_waker() -> Waker {
-    const VTABLE: RawWakerVTable =
-        RawWakerVTable::new(|ptr| RawWaker::new(ptr, &VTABLE), |_| {}, |_| {}, |_| {});
-    const RAW: RawWaker = RawWaker::new(0 as *const (), &VTABLE);
-    unsafe { Waker::from_raw(RAW) }
-}
-
 #[tokio::test]
 async fn non_stacky_async_activations() -> Result<()> {
     let mut config = Config::new();
@@ -847,7 +840,7 @@ async fn non_stacky_async_activations() -> Result<()> {
 
             let module2 = module2.clone();
             let mut store2 = Store::new(caller.engine(), ());
-            let mut linker2 = Linker::new(caller.engine());
+            let mut linker2 = Linker::<()>::new(caller.engine());
             linker2
                 .func_wrap_async("", "yield", {
                     let stacks = stacks.clone();
@@ -876,7 +869,7 @@ async fn non_stacky_async_activations() -> Result<()> {
                             .await?;
 
                         capture_stack(&stacks, &store2);
-                        Ok(())
+                        anyhow::Ok(())
                     }
                 }) as _)
                 .await
@@ -963,7 +956,9 @@ async fn gc_preserves_externref_on_historical_async_stacks() -> Result<()> {
 
     let mut store = Store::new(&engine, None);
     let mut linker = Linker::<Option<F>>::new(&engine);
-    linker.func_wrap("", "gc", |mut cx: Caller<'_, _>| cx.gc())?;
+    linker.func_wrap_async("", "gc", |mut cx: Caller<'_, _>, ()| {
+        Box::new(async move { cx.gc_async(None).await })
+    })?;
     linker.func_wrap(
         "",
         "test",
@@ -981,7 +976,7 @@ async fn gc_preserves_externref_on_historical_async_stacks() -> Result<()> {
         |mut cx: Caller<'_, Option<F>>, (val,): (i32,)| {
             let func = cx.data().clone().unwrap();
             Box::new(async move {
-                let r = Some(ExternRef::new(&mut cx, val)?);
+                let r = Some(ExternRef::new_async(&mut cx, val).await?);
                 Ok(func.call_async(&mut cx, (val, r)).await)
             })
         },
@@ -990,7 +985,7 @@ async fn gc_preserves_externref_on_historical_async_stacks() -> Result<()> {
     let func: F = instance.get_typed_func(&mut store, "run")?;
     *store.data_mut() = Some(func.clone());
 
-    let r = Some(ExternRef::new(&mut store, 5)?);
+    let r = Some(ExternRef::new_async(&mut store, 5).await?);
     func.call_async(&mut store, (5, r)).await?;
 
     Ok(())
@@ -1002,14 +997,15 @@ async fn async_gc_with_func_new_and_func_wrap() -> Result<()> {
 
     let mut config = Config::new();
     config.async_support(true);
+    config.wasm_gc(true);
     let engine = Engine::new(&config)?;
 
     let module = Module::new(
         &engine,
         r#"
             (module $m1
-                (import "" "a" (func $a (result externref)))
-                (import "" "b" (func $b (result externref)))
+                (import "" "a" (func $a (result externref structref arrayref)))
+                (import "" "b" (func $b (result externref structref arrayref)))
 
                 (table 2 funcref)
                 (elem (i32.const 0) func $a $b)
@@ -1024,10 +1020,14 @@ async fn async_gc_with_func_new_and_func_wrap() -> Result<()> {
                 (func $call (param i32)
                     (local $cnt i32)
                     (loop $l
-                        (drop (call_indirect (result externref) (local.get 0)))
+                        (call_indirect (result externref structref arrayref) (local.get 0))
+                        drop
+                        drop
+                        drop
+
                         (local.set $cnt (i32.add (local.get $cnt) (i32.const 1)))
 
-                        (if (i32.lt_u (local.get $cnt) (i32.const 1000))
+                        (if (i32.lt_u (local.get $cnt) (i32.const 5000))
                          (then (br $l)))
                     )
                 )
@@ -1035,14 +1035,51 @@ async fn async_gc_with_func_new_and_func_wrap() -> Result<()> {
         "#,
     )?;
 
-    let mut linker = Linker::new(&engine);
-    linker.func_wrap("", "a", |mut cx: Caller<'_, _>| {
-        Ok(Some(ExternRef::new(&mut cx, 100)?))
+    let mut linker = Linker::<()>::new(&engine);
+    linker.func_wrap_async("", "a", |mut cx: Caller<'_, _>, ()| {
+        Box::new(async move {
+            let externref = ExternRef::new_async(&mut cx, 100).await?;
+
+            let struct_ty = StructType::new(cx.engine(), [])?;
+            let struct_pre = StructRefPre::new(&mut cx, struct_ty);
+            let structref = StructRef::new_async(&mut cx, &struct_pre, &[]).await?;
+
+            let array_ty = ArrayType::new(
+                cx.engine(),
+                FieldType::new(Mutability::Var, ValType::I32.into()),
+            );
+            let array_pre = ArrayRefPre::new(&mut cx, array_ty);
+            let arrayref = ArrayRef::new_fixed_async(&mut cx, &array_pre, &[]).await?;
+
+            Ok((Some(externref), Some(structref), Some(arrayref)))
+        })
     })?;
-    let ty = FuncType::new(&engine, [], [ValType::EXTERNREF]);
-    linker.func_new("", "b", ty, |mut cx, _, results| {
-        results[0] = ExternRef::new(&mut cx, 100)?.into();
-        Ok(())
+    let ty = FuncType::new(
+        &engine,
+        [],
+        [ValType::EXTERNREF, ValType::STRUCTREF, ValType::ARRAYREF],
+    );
+    linker.func_new_async("", "b", ty, |mut cx, _, results| {
+        Box::new(async move {
+            results[0] = ExternRef::new_async(&mut cx, 100).await?.into();
+
+            let struct_ty = StructType::new(cx.engine(), [])?;
+            let struct_pre = StructRefPre::new(&mut cx, struct_ty);
+            results[1] = StructRef::new_async(&mut cx, &struct_pre, &[])
+                .await?
+                .into();
+
+            let array_ty = ArrayType::new(
+                cx.engine(),
+                FieldType::new(Mutability::Var, ValType::I32.into()),
+            );
+            let array_pre = ArrayRefPre::new(&mut cx, array_ty);
+            results[2] = ArrayRef::new_fixed_async(&mut cx, &array_pre, &[])
+                .await?
+                .into();
+
+            Ok(())
+        })
     })?;
 
     let mut store = Store::new(&engine, ());

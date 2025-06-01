@@ -3,11 +3,11 @@
 //! Helps implement fast indirect call signature checking, reference type
 //! downcasting, and etc...
 
+use crate::Engine;
 use crate::hash_set::HashSet;
 use crate::prelude::*;
 use crate::sync::RwLock;
 use crate::vm::GcRuntime;
-use crate::Engine;
 use alloc::borrow::Cow;
 use alloc::sync::Arc;
 use core::iter;
@@ -22,10 +22,9 @@ use core::{
     },
 };
 use wasmtime_environ::{
-    iter_entity_range,
-    packed_option::{PackedOption, ReservedValue},
     EngineOrModuleTypeIndex, GcLayout, ModuleInternedTypeIndex, ModuleTypes, PrimaryMap,
-    SecondaryMap, TypeTrace, VMSharedTypeIndex, WasmRecGroup, WasmSubType,
+    SecondaryMap, TypeTrace, VMSharedTypeIndex, WasmRecGroup, WasmSubType, iter_entity_range,
+    packed_option::{PackedOption, ReservedValue},
 };
 use wasmtime_slab::{Id as SlabId, Slab};
 
@@ -696,7 +695,7 @@ impl TypeRegistryInner {
         log::trace!("registering rec group of length {}", types.len());
         debug_assert_eq!(iter_entity_range(range.clone()).len(), types.len());
 
-        // We need two different canonicalizations of this rec group: one for
+        // We need two different canonicalization of this rec group: one for
         // hash-consing and another for runtime usage within this
         // engine. However, we only need the latter if this is a new rec group
         // that hasn't been registered before. Therefore, we only eagerly create
@@ -784,9 +783,10 @@ impl TypeRegistryInner {
                     let engine_index = shared_type_indices[rec_group_offset];
                     log::trace!("    intra-group {module_index:?} becomes {engine_index:?}");
                     assert!(!engine_index.is_reserved_value());
-                    assert!(self
-                        .types
-                        .contains(shared_type_index_to_slab_id(engine_index)));
+                    assert!(
+                        self.types
+                            .contains(shared_type_index_to_slab_id(engine_index))
+                    );
                     engine_index
                 }
             });

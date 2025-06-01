@@ -93,15 +93,19 @@ where
     /// connected to an asynchronous store.
     ///
     /// [`Trap`]: crate::Trap
+    #[inline]
     pub fn call(&self, mut store: impl AsContextMut, params: Params) -> Result<Results> {
         let mut store = store.as_context_mut();
         assert!(
             !store.0.async_support(),
             "must use `call_async` with async stores"
         );
+
+        #[cfg(feature = "gc")]
         if Self::need_gc_before_call_raw(store.0, &params) {
-            store.0.gc();
+            store.gc(None);
         }
+
         let func = self.func.vm_func_ref(store.0);
         unsafe { Self::call_raw(&mut store, &self.ty, func, params) }
     }
@@ -124,22 +128,22 @@ where
     ///
     /// [`Trap`]: crate::Trap
     #[cfg(feature = "async")]
-    pub async fn call_async<T>(
+    pub async fn call_async(
         &self,
-        mut store: impl AsContextMut<Data = T>,
+        mut store: impl AsContextMut<Data: Send>,
         params: Params,
-    ) -> Result<Results>
-    where
-        T: Send,
-    {
+    ) -> Result<Results> {
         let mut store = store.as_context_mut();
         assert!(
             store.0.async_support(),
             "must use `call` with non-async stores"
         );
+
+        #[cfg(feature = "gc")]
         if Self::need_gc_before_call_raw(store.0, &params) {
-            store.0.gc_async().await;
+            store.gc_async(None).await?;
         }
+
         store
             .on_fiber(|store| {
                 let func = self.func.vm_func_ref(store.0);
@@ -149,8 +153,8 @@ where
     }
 
     #[inline]
+    #[cfg(feature = "gc")]
     pub(crate) fn need_gc_before_call_raw(_store: &StoreOpaque, _params: &Params) -> bool {
-        #[cfg(feature = "gc")]
         {
             // See the comment in `Func::call_impl_check_args`.
             let num_gc_refs = _params.vmgcref_pointing_to_object_count();
@@ -599,7 +603,9 @@ unsafe impl WasmTy for Option<Func> {
         } else if nullable {
             Ok(())
         } else {
-            bail!("argument type mismatch: expected non-nullable (ref {expected}), found null reference")
+            bail!(
+                "argument type mismatch: expected non-nullable (ref {expected}), found null reference"
+            )
         }
     }
 

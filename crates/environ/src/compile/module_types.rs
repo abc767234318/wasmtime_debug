@@ -1,8 +1,7 @@
 use crate::{
-    wasm_unsupported, EngineOrModuleTypeIndex, EntityRef, ModuleInternedRecGroupIndex,
-    ModuleInternedTypeIndex, ModuleTypes, TypeConvert, TypeIndex, WasmArrayType,
-    WasmCompositeInnerType, WasmCompositeType, WasmFuncType, WasmHeapType, WasmResult,
-    WasmStructType, WasmSubType,
+    EngineOrModuleTypeIndex, EntityRef, ModuleInternedRecGroupIndex, ModuleInternedTypeIndex,
+    ModuleTypes, TypeConvert, TypeIndex, WasmArrayType, WasmCompositeInnerType, WasmCompositeType,
+    WasmFuncType, WasmHeapType, WasmResult, WasmStructType, WasmSubType, wasm_unsupported,
 };
 use std::{borrow::Cow, collections::HashMap, ops::Index};
 use wasmparser::{UnpackedIndex, Validator, ValidatorId};
@@ -114,7 +113,7 @@ impl ModuleTypesBuilder {
                 unreachable!("no need to lookup indexes; we already have core type IDs")
             })
             .with_rec_group(validator_types, rec_group_id)
-            .convert_sub_type(ty);
+            .convert_sub_type(ty)?;
             self.wasm_sub_type_in_rec_group(id, wasm_ty);
         }
 
@@ -264,16 +263,19 @@ impl ModuleTypesBuilder {
         assert_eq!(validator_types.id(), self.validator_id);
 
         let rec_group_id = validator_types.rec_group_id_of(id);
-        debug_assert!(validator_types
-            .rec_group_elements(rec_group_id)
-            .any(|e| e == id));
+        debug_assert!(
+            validator_types
+                .rec_group_elements(rec_group_id)
+                .any(|e| e == id)
+        );
 
         let interned_rec_group = self.intern_rec_group(validator_types, rec_group_id)?;
 
         let interned_type = self.wasmparser_to_wasmtime[&id];
-        debug_assert!(self
-            .rec_group_elements(interned_rec_group)
-            .any(|e| e == interned_type));
+        debug_assert!(
+            self.rec_group_elements(interned_rec_group)
+                .any(|e| e == interned_type)
+        );
 
         Ok(interned_type)
     }
